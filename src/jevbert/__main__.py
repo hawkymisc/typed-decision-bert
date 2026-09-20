@@ -14,6 +14,7 @@ import uvicorn
 from jevbert import __version__
 from jevbert.api.app import create_app
 from jevbert.config import API_KEYS_ENV, ConfigurationError, load_settings
+from jevbert.fetch import fetch_model
 from jevbert.inference.registry import build_registry
 
 #: One line per record; the access logger writes a complete JSON object as its message.
@@ -39,7 +40,9 @@ def main(argv: list[str] | None = None) -> int:
     init_env = subcommands.add_parser("init-env", help="write a .env holding a new API key")
     init_env.add_argument("--path", default=".env", help="destination file (default: .env)")
 
-    subcommands.add_parser("fetch-model", help="download the pinned model revision")
+    fetch = subcommands.add_parser("fetch-model", help="download the pinned model revision")
+    fetch.add_argument("--manifests-dir", default="manifests", help="default: manifests")
+    fetch.add_argument("--models-dir", default="models", help="default: models")
 
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=_LOG_FORMAT)
@@ -48,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "init-env":
         return _init_env(Path(args.path))
-    return _fetch_model()
+    return fetch_model(Path(args.manifests_dir), Path(args.models_dir))
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -91,17 +94,6 @@ def _init_env(path: Path) -> int:
         handle.write(_ENV_TEMPLATE.format(env=API_KEYS_ENV, key=key))
     print(f"jevbert: wrote a new API key to {path}. Keep it secret and out of git.")
     return 0
-
-
-def _fetch_model() -> int:
-    # Phase 2 implements the pinned-revision download and the manifest hash recording
-    # (ADR-014). Failing loudly beats pretending the weights are in place.
-    print(
-        "jevbert: fetch-model is not implemented yet (phase 2). Until then the server "
-        "can only serve bundles whose weights and manifest are already present.",
-        file=sys.stderr,
-    )
-    return 3
 
 
 if __name__ == "__main__":

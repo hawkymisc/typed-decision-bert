@@ -67,8 +67,22 @@ class TestInitEnv:
 
 
 class TestOtherCommands:
-    def test_fetch_model_reports_that_it_is_unimplemented(self) -> None:
-        assert main(["fetch-model"]) == 3
+    def test_fetch_model_refuses_when_the_manifest_is_absent(self, tmp_path: Path) -> None:
+        # The manifest ships with the repository; fetch-model fills in its hashes and
+        # never invents one, so a wrong --manifests-dir must stop before any download.
+        assert (
+            main(
+                [
+                    "fetch-model",
+                    "--manifests-dir",
+                    str(tmp_path / "absent"),
+                    "--models-dir",
+                    str(tmp_path / "models"),
+                ]
+            )
+            == 4
+        )
+        assert not (tmp_path / "models").exists()
 
     def test_serve_with_an_unreadable_config_exits_with_two(self, tmp_path: Path) -> None:
         assert main(["serve", "--config", str(tmp_path / "absent.yaml")]) == 2

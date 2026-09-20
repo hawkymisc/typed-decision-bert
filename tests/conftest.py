@@ -13,13 +13,23 @@ from jevbert.api.app import create_app
 from jevbert.api.encoding import dumps
 from jevbert.backends.base import Backend
 from jevbert.backends.fake import FakeBackend
+from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.config import Limits, ServingSettings, Settings
-from jevbert.inference.registry import Bundle, ModelRegistry, read_manifest
+from jevbert.fetch import MANIFEST_FILENAME, mismatched_files, model_directory
+from jevbert.inference.registry import (
+    Bundle,
+    BundleManifest,
+    ModelRegistry,
+    backend_context,
+    build_backend,
+    read_manifest,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFESTS_DIR = PROJECT_ROOT / "manifests"
 MODELS_DIR = PROJECT_ROOT / "models"
 FAKE_MANIFEST = MANIFESTS_DIR / "jevbert-fake-0.0.0.json"
+NLI_MANIFEST = MANIFESTS_DIR / MANIFEST_FILENAME
 
 #: At least ``MIN_API_KEY_LENGTH`` characters, like every key the server accepts (S-L4).
 API_KEY = "test-api-key-0123456789-abcdefghij"
@@ -91,3 +101,41 @@ def systemone(
 
 def request_body(questions: dict[str, Any], state: Any = "顧客からの問い合わせ") -> dict[str, Any]:
     return {"model": MODEL, "state": state, "questions": questions}
+
+
+def require_nli_weights() -> tuple[BundleManifest, str, Path]:
+    """Skip unless the pinned weights are present and match the manifest.
+
+    The message names the command that fixes it: a model test that is skipped for an
+    unstated reason reads exactly like a model test that passed.
+    """
+    if not NLI_MANIFEST.is_file():
+        pytest.skip(f"{NLI_MANIFEST.name} is not in manifests/")
+    manifest, digest = read_manifest(NLI_MANIFEST)
+    source = manifest.source_model
+    if source is None or not source.files:
+        pytest.skip(f"{NLI_MANIFEST.name} records no source_model.files")
+    directory = model_directory(MODELS_DIR, source.repo)
+    bad = mismatched_files(directory, source.files)
+    if bad:
+        pytest.skip(
+            f"{len(bad)} model files are missing or stale under {directory} "
+            "- run `uv run python -m jevbert fetch-model`"
+        )
+    return manifest, digest, directory
+
+
+@pytest.fixture(scope="session")
+def nli_backend() -> NliZeroShotBackend:
+    """The real backend, loaded once for the whole session.
+
+    Built through ``build_backend`` rather than by hand, so that the tests exercise the
+    same manifest-to-backend wiring the server uses - including the dtype the manifest
+    declares.
+    """
+    manifest, _, _ = require_nli_weights()
+    settings = build_settings(models_dir=MODELS_DIR)
+    backend = build_backend(manifest, backend_context(settings))
+    assert isinstance(backend, NliZeroShotBackend)
+    backend.load()
+    return backend

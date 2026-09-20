@@ -29,9 +29,11 @@ from jevbert.backends.base import (
     TextPair,
 )
 from jevbert.backends.fake import FakeBackend
+from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.compiler.compiled import TokenBudget
 from jevbert.compiler.normalize import canonical_json
 from jevbert.config import ConfigurationError, Settings
+from jevbert.fetch import model_directory
 
 logger = logging.getLogger("jevbert.registry")
 
@@ -299,10 +301,38 @@ def _build_fake(manifest: BundleManifest, context: BackendContext) -> Backend:
     return FakeBackend()
 
 
-#: Backend ID -> factory. Phase 2 adds ``a0-nli-zeroshot-v1`` here and nothing else in
-#: this module has to change.
+def _build_nli(manifest: BundleManifest, context: BackendContext) -> Backend:
+    """Build the zero-shot NLI backend from the manifest's pinned source model.
+
+    The directory is derived from the manifest's repo ID, not from anything a caller
+    can influence, and the per-file hashes travel with it so that the backend refuses
+    to load bytes the manifest does not vouch for (spec 15.3).
+    """
+    source = manifest.source_model
+    if source is None:
+        raise ConfigurationError(
+            f"{manifest.public_id}: backend {manifest.backend!r} needs a source_model "
+            "with a pinned revision and per-file hashes."
+        )
+    if not source.files:
+        raise ConfigurationError(
+            f"{manifest.public_id}: the manifest records no source_model.files. "
+            "Run `python -m jevbert fetch-model` before starting the server."
+        )
+    return NliZeroShotBackend(
+        model_directory(context.models_dir, source.repo),
+        max_batch_tokens=context.max_batch_tokens,
+        max_batch_sequences=context.max_batch_sequences,
+        device=context.device,
+        dtype=manifest.dtype,
+        expected_file_hashes=source.files,
+    )
+
+
+#: Backend ID -> factory.
 _BACKEND_FACTORIES: dict[str, BackendFactory] = {
     FakeBackend.backend_id: _build_fake,
+    NliZeroShotBackend.backend_id: _build_nli,
 }
 
 

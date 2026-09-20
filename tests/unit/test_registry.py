@@ -11,7 +11,9 @@ import pytest
 from jevbert.api.errors import ModelNotFoundError
 from jevbert.backends.base import Backend, CancelToken, EncodedSequence, TextPair
 from jevbert.backends.fake import FakeBackend
+from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.config import ConfigurationError, Limits, ServingSettings
+from jevbert.fetch import model_directory
 from jevbert.inference.registry import (
     _BACKEND_FACTORIES,
     BackendContext,
@@ -376,3 +378,39 @@ class TestModelListing:
         assert entry["name"] == MODEL
         assert entry["release_date"] == RAW_MANIFEST["release_date"]
         assert entry["description"] == RAW_MANIFEST["description"]
+
+
+class TestNliBackendFactory:
+    """a0-nli-zeroshot-v1 is built from the manifest alone (A-F5, spec 15.3)."""
+
+    def _manifest(self, **source_overrides: Any) -> BundleManifest:
+        source = {
+            "repo": "MoritzLaurer/bge-m3-zeroshot-v2.0",
+            "revision": "9abf1c8aaeb82a2447809c20753ed0b106b76652",
+            "files": {"config.json": "ab" * 32},
+        }
+        source.update(source_overrides)
+        payload = dict(RAW_MANIFEST)
+        payload.update(backend="a0-nli-zeroshot-v1", source_model=source)
+        return BundleManifest.model_validate(payload)
+
+    def test_the_backend_id_is_registered(self) -> None:
+        assert "a0-nli-zeroshot-v1" in _BACKEND_FACTORIES
+
+    def test_the_model_directory_comes_from_the_manifest_repo(self, tmp_path: Path) -> None:
+        backend = build_backend(self._manifest(), _context(tmp_path))
+        assert isinstance(backend, NliZeroShotBackend)
+        assert backend.model_dir == model_directory(tmp_path, "MoritzLaurer/bge-m3-zeroshot-v2.0")
+
+    def test_a_manifest_without_a_source_model_refuses_startup(self, tmp_path: Path) -> None:
+        payload = dict(RAW_MANIFEST)
+        payload.update(backend="a0-nli-zeroshot-v1", source_model=None)
+        manifest = BundleManifest.model_validate(payload)
+        with pytest.raises(ConfigurationError, match="source_model"):
+            build_backend(manifest, _context(tmp_path))
+
+    def test_a_manifest_without_file_hashes_refuses_startup(self, tmp_path: Path) -> None:
+        # Unverifiable weights are worse than absent ones: the bundle digest would
+        # promise an identity the loaded bytes never had to match (spec 5.7, 15.3).
+        with pytest.raises(ConfigurationError, match="fetch-model"):
+            build_backend(self._manifest(files={}), _context(tmp_path))

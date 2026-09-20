@@ -434,4 +434,104 @@ uv run pytest                                # 全テスト
 
 ## 12. 実装・検証で判明した差分（実装後に追記）
 
-（未記入。実装・検証の結果、本書の設計から変えた点と理由、想定外の挙動をここへ追記する。）
+### 12.1 フェーズ1（API層・contract・compiler・fake backend、2026-09-21）
+
+実装したのは実モデル backend 以外の全部である。`backends/nli.py`、`evaluation/smoke.py`、
+`scripts/`、READMEの充足表、`docs/POC_RESULTS.md` はフェーズ2に残した。
+
+#### D1. 付録Cの検算値 `score = 1.6` は参照実装からは出ない（仕様書側の不正確）
+
+仕様書付録Cの検算表は Score 分布 `[0.1, 0.2, 0.7]` に対し `score = 1.6` としているが、
+**同じ付録Cの参照実装はこの入力に対して `1.5999999999999999`（1.6 の 1 ulp 下）を返す**。
+`math.fsum(0*0.1 + 1*0.2 + 2*0.7)` の丸めによるもので、`_checked_probabilities` の再正規化とは
+無関係である（`math.fsum([0.1,0.2,0.7])` はちょうど `1.0` になるため、再正規化は値を変えない）。
+
+`1.6` は数学的な値としては正しく、参照実装は「改変禁止」であるため、**どちらも変更していない**。
+テスト（`tests/unit/test_numeric.py`）は参照実装の実際の出力を固定値で pin したうえで、
+1 ulp 以内であることを併記している。I06 の許容誤差は `1e-6` なので不変条件には影響しない。
+仕様書 §5.6 の応答例が `"score": 1.6` である点も同様（表示上の値であり、実出力とは 1 ulp 異なりうる）。
+
+#### D2. `serializer-nli-v1` に第2の描画衝突がある（L02、`compat/differences.md`）
+
+POC_DESIGN §5.1 は `"[1]"` と `[1]` の衝突（L01）を既知の制限として挙げているが、
+実装とテスト中に**同じ family の衝突をもう1つ**発見した。Choice 候補を `"<key>: <description>"`
+で描画するため、候補 `"a"`（説明 `"b"`）と候補 `"a: b"`（説明 null）の hypothesis が一致する。
+結果として両候補は同一 logit を受け取り、同率として扱われる。API の構造（キー集合・分布）は
+壊れないが、モデルはこの2候補を区別できない。`compat/differences.md` の L02 に記録し、
+`tests/contract/test_markers.py` で挙動を固定した（黙って変わらないようにするため）。
+A1 の `serializer-v1` はキーと説明を `typed_json({name, description})` で分離するため発生しない。
+
+#### D3. 検証順序に readiness（503）の位置を明記
+
+§3 のパイプラインは 422 `model_not_found` の次を compiler としているが、
+bundle が決まってからでないと readiness を判定できない。実装の順序は
+
+`401 → 415 → 413 → 400 → 422(構造/深さ) → 422(model_not_found) → 503(model_unavailable) → 422(context_length_exceeded) → 推論`
+
+とした。未登録モデルは readiness と無関係に 422 になり、登録済みだが未ロードなら 503 になる。
+
+#### D4. モジュールを2つ追加
+
+§3.1 のモジュール構成に対し、次の2つを追加した。いずれも責務の切り出しであり、設計変更ではない。
+
+- `api/encoding.py`：応答 JSON の書き出し（float を必ず小数表記にする、キー順を保つ）。
+  `api/errors.py` と `api/routes.py` の両方から使うため、`contracts/response.py` には置けない。
+- `contracts/__init__.py` の `load_schema()`：付録A・Bの schema ファイル読み込み。
+
+`compiler/serializer_nli.py` に `encode_request()`（tokenize と token 予算の適用）を置いた。
+compiler が (premise, hypothesis) までを担当し、token 数の計数と ID 組み立ては Backend の
+`count_and_encode` が持つという分担は §6.1 のとおりである。
+
+#### D5. engine の admission 枠は worker thread 側で解放する
+
+「`max_pending_requests` に達していたら529」を素直に `future.add_done_callback` で実装すると、
+**コールバックが await の再開より後に走る**ため、逐次的な呼び出しでもキューが空なのに 529 を返す。
+実測で確認したうえで、枠の解放を worker thread 内の `finally` へ移した（`threading.Lock` で保護）。
+これにより「deadline で待つのをやめたリクエストの枠が、worker が実際に終わるまで解放されない」という
+本来の意味（§6.4「受付中＋実行中」）も正しくなる。
+
+#### D6. `count_and_encode` を event loop 上で呼んでいる
+
+token 予算の判定（422）は engine への投入（529/504）より前でなければならないため、
+`count_and_encode` はリクエストハンドラ内、すなわち event loop 上で同期的に呼んでいる。
+tokenizer に触るのが常に単一スレッドになるので thread safety の問題は起きない一方、
+**実 tokenizer で長い入力を処理する間 event loop が塞がる**。PoC の同時実行数では許容するが、
+フェーズ2でレイテンシーを実測し、必要なら専用スレッドへ移す（その場合も 422 の判定順序は保つこと）。
+
+#### D7. K1（PyTorch × RTX 5090）は解決済み
+
+`torch==2.11.0+cu128` を PyTorch 公式 index の explicit index 指定（`[[tool.uv.index]]` +
+`[tool.uv.sources]`）で導入し、`uv sync` が一度で通った。実測:
+
+```text
+2.11.0+cu128 True NVIDIA GeForce RTX 5090 (12, 0)
+```
+
+compute capability `(12, 0)` = sm_120 を認識している。§11 の切り分け（別 CUDA 版 index、Python 3.11）は
+不要だった。`transformers==5.17.0` も同時に導入済みで、`uv.lock` で固定した。
+
+#### D8. K5（SDK の strict 検証と float）は「整数でも通る」
+
+§11 K5 は「`strict=True` が整数値に見える float（`1.0`）や指数表記を受理するか」を未知数としていたが、
+実測の答えは**受理する**。SDK 0.7.0 の応答モデルは `ConfigDict(extra="ignore", frozen=True, strict=True)`
+だが、pydantic v2 の strict モードは float 型フィールドに対して int を許容する（python モード・
+JSON モードとも）。したがって `{"confidence": 1}` でも復元できる。
+
+とはいえ本実装は §7 の指示どおり float を必ず小数表記で出力する（指数表記は `Decimal` で位取り記法へ
+展開し、丸めない）。これは SDK 0.7.0 に対しては保険であり、要求ではない。
+
+その他 SDK 実挙動の観測は `compat/upstream/README.md` に記録した。特に、例外の status 属性は
+**`status` であって `status_code` ではない**（仕様書 §3.4 の記載どおり）。
+
+#### D9. `GET /v1/models` での alias の出し方
+
+§4.4 は「不変IDと、有効化されたaliasを含む」とだけ書いている。実装では alias を独立した行として
+並べ、`description` を `"Alias for <target>. <元の説明>"`、`release_date` を対象 bundle の値とした。
+実 Jev がどう返すかは未確認である。
+
+#### D10. fake bundle の登録方法
+
+§6.2 の「設定で明示的に有効化したときだけ登録する（既定は無効）」を、
+`enable_fake_bundle: true` のときだけ `manifests/jevbert-fake-0.0.0.json` を読み込む形で実装した。
+加えて、**`bundles:` に fake の manifest を書いても `enable_fake_bundle` が false なら起動を拒否する**
+（設定ミスで意味のない回答を返すサーバーが上がらないようにするため）。

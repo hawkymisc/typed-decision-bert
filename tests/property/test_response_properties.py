@@ -16,6 +16,9 @@ from fastapi.testclient import TestClient
 from hypothesis import HealthCheck, given, settings
 from jsonschema import Draft202012Validator
 
+from jevbert.backends.fake import _SPECIAL_TOKEN_COUNT as FAKE_SPECIAL_TOKEN_COUNT
+from jevbert.compiler.normalize import render
+from jevbert.compiler.serializer_nli import DEFAULT_NOUL_FALSE, DEFAULT_NOUL_TRUE
 from jevbert.contracts import load_schema
 from jevbert.scoring.numeric import expected_score, normalized_entropy_confidence, select_choice
 from tests.conftest import MODEL, build_client, systemone
@@ -77,8 +80,48 @@ def check_invariants(body: dict[str, Any], payload: dict[str, Any]) -> None:
             assert answer["legend"] == {str(i): level for i, level in enumerate(levels)}
 
     assert payload["usage"]["output_tokens"] == 0
-    assert payload["usage"]["input_tokens"] >= 0
+    # Recomputed rather than merely bounded: under expanded-input-a0-v1 the count is
+    # every candidate sequence of every question (spec 5.8), which is exactly the
+    # number a truncation or a dropped candidate would change. ">= 0" survives both.
+    assert payload["usage"]["input_tokens"] == expected_input_tokens(body)
     assert payload["model"] == MODEL
+
+
+def expected_input_tokens(body: dict[str, Any]) -> int:
+    """Re-derive ``usage.input_tokens`` from the request, the fake backend's way.
+
+    The fake counts UTF-8 bytes plus four special tokens per sequence (POC_DESIGN 6.2),
+    and the serializer builds one sequence per candidate with the template of 5.3.
+    """
+    premise = render(body["state"])
+    total = 0
+    for question in body["questions"].values():
+        instruction = question.get("instructions")
+        rendered = None if instruction is None else render(instruction)
+        for candidate in candidate_texts(question):
+            hypothesis = candidate if not rendered else f"{rendered} — {candidate}"
+            total += (
+                len(premise.encode())
+                + len(hypothesis.encode())
+                + FAKE_SPECIAL_TOKEN_COUNT
+            )
+    return total
+
+
+def candidate_texts(question: dict[str, Any]) -> list[str]:
+    criteria = question.get("criteria")
+    if question["type"] == "noul":
+        sides = criteria or {}
+        return [
+            DEFAULT_NOUL_FALSE if sides.get("false") is None else render(sides["false"]),
+            DEFAULT_NOUL_TRUE if sides.get("true") is None else render(sides["true"]),
+        ]
+    if question["type"] == "choice":
+        return [
+            key if description is None else f"{key}: {render(description)}"
+            for key, description in sorted(criteria.items())
+        ]
+    return [render(level) for level in criteria]
 
 
 class TestPT02Responses:

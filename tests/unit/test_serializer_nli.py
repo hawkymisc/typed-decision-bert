@@ -70,6 +70,41 @@ class TestNoul:
         assert compiled.pairs[1].hypothesis == DEFAULT_NOUL_TRUE
 
 
+class TestEmptyInstructions:
+    """A-F11: an instruction that renders to nothing is no instruction."""
+
+    def test_an_empty_string_instruction_does_not_prefix_a_separator(self) -> None:
+        # Without this every candidate began " — ", which is a template artefact the
+        # model has to read as if it meant something.
+        compiled = _one("s", {"type": "noul", "instructions": ""})
+        assert compiled.pairs[1].hypothesis == DEFAULT_NOUL_TRUE
+        assert not compiled.pairs[1].hypothesis.startswith(" ")
+
+    def test_an_empty_string_compiles_like_an_absent_instruction(self) -> None:
+        empty = _one("s", {"type": "noul", "instructions": ""})
+        absent = _one("s", {"type": "noul"})
+        assert empty.pairs == absent.pairs
+
+    @pytest.mark.parametrize(
+        ("instructions", "rendered"), [([], "[]"), ({}, "{}"), (" ", " ")]
+    )
+    def test_a_structured_or_blank_instruction_is_kept_as_written(
+        self, instructions: Any, rendered: str
+    ) -> None:
+        # Only the empty string means "nothing to say". An empty array or object
+        # renders to two characters and is content like any other (spec 6.1).
+        compiled = _one("s", {"type": "noul", "instructions": instructions})
+        assert compiled.pairs[1].hypothesis == f"{rendered} — {DEFAULT_NOUL_TRUE}"
+
+    def test_the_rule_applies_to_every_question_type(self) -> None:
+        choice = _one(
+            "s", {"type": "choice", "instructions": "", "criteria": {"a": None, "b": None}}
+        )
+        score = _one("s", {"type": "score", "instructions": "", "criteria": ["x", "y"]})
+        assert [pair.hypothesis for pair in choice.pairs] == ["a", "b"]
+        assert [pair.hypothesis for pair in score.pairs] == ["x", "y"]
+
+
 class TestChoice:
     def test_candidates_are_ordered_by_code_point(self) -> None:
         # spec 6.1: HTTP insertion order must not reach the model.
@@ -184,3 +219,61 @@ class TestTokenBudget:
             seq.token_count for q in encoded.questions for seq in q.sequences
         )
         assert len(encoded.questions[0].sequences) == 2
+
+
+class TestCharacterCeiling:
+    """S-H2 at unit level: the expansion is measured before it is built."""
+
+    @staticmethod
+    def _body(state: str, options: int, instructions: str | None = None) -> Any:
+        question: dict[str, Any] = {
+            "type": "choice",
+            "criteria": {f"k{index:03d}": None for index in range(options)},
+        }
+        if instructions is not None:
+            question["instructions"] = instructions
+        return {"model": "m", "state": state, "questions": {"q": question}}
+
+    def _compile(self, body: Any, max_request_chars: int) -> Any:
+        return compile_request(
+            validate_request(body, LIMITS), max_request_chars=max_request_chars
+        )
+
+    def test_the_total_counts_the_premise_once_per_candidate(self) -> None:
+        # 4 options x 10 characters of state, plus 4 keys of 4 characters = 56.
+        body = self._body("x" * 10, 4)
+        self._compile(body, max_request_chars=56)
+        with pytest.raises(ContextLengthExceededError):
+            self._compile(body, max_request_chars=55)
+
+    def test_the_total_counts_the_instruction_once_per_candidate(self) -> None:
+        # The same 56, plus 4 x 20 characters of instruction.
+        body = self._body("x" * 10, 4, instructions="i" * 20)
+        self._compile(body, max_request_chars=136)
+        with pytest.raises(ContextLengthExceededError):
+            self._compile(body, max_request_chars=135)
+
+    def test_the_refusal_names_the_offending_question(self) -> None:
+        with pytest.raises(ContextLengthExceededError) as excinfo:
+            self._compile(self._body("x" * 10, 4), max_request_chars=1)
+        assert excinfo.value.path == ["questions", "q"]
+
+    def test_the_total_is_cumulative_across_questions(self) -> None:
+        body = {
+            "model": "m",
+            "state": "x" * 10,
+            "questions": {
+                "a": {"type": "noul", "criteria": {"true": "y", "false": "n"}},
+                "b": {"type": "noul", "criteria": {"true": "y", "false": "n"}},
+            },
+        }
+        # Each question is 2 x (10 + 1) = 22 characters.
+        self._compile(body, max_request_chars=44)
+        with pytest.raises(ContextLengthExceededError) as excinfo:
+            self._compile(body, max_request_chars=43)
+        assert excinfo.value.path == ["questions", "b"]
+
+    def test_omitting_the_ceiling_compiles_unconditionally(self) -> None:
+        # Unit callers that are not serving a request (test_markers.py) pass nothing.
+        compiled = compile_request(validate_request(self._body("x" * 10_000, 255), LIMITS))
+        assert len(compiled.questions[0].pairs) == 255

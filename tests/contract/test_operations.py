@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
+import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from jevbert import CONFIDENCE_DEFINITION, CONTRACT_PROFILE
-from jevbert.backends.base import CancelToken, EncodedSequence, TextPair
+from jevbert.api.app import create_app
+from jevbert.backends.base import (
+    WARMUP_PREMISE,
+    CancelToken,
+    EncodedSequence,
+    InferenceCancelled,
+    TextPair,
+)
 from jevbert.backends.fake import FakeBackend
-from jevbert.config import ServingSettings
+from jevbert.config import ConfigurationError, ServingSettings, Settings
 from jevbert.inference.registry import build_registry as registry_from_settings
 from tests.conftest import (
     API_KEY,
     AUTH,
+    FAKE_MANIFEST,
     MODEL,
     build_client,
     build_registry,
@@ -199,6 +212,131 @@ class TestCapabilities:
         assert any("confidence" in item for item in payload["known_differences"])
         assert any("usage" in item for item in payload["known_differences"])
 
+    def test_the_published_limits_are_the_ones_in_force(self, client: TestClient) -> None:
+        limits = client.get("/jevbert/v1/capabilities", headers=AUTH).json()["limits"]
+        configured = build_settings().limits
+        assert limits["max_body_bytes"] == configured.max_body_bytes == 2_097_152
+        assert limits["max_json_depth"] == configured.max_json_depth == 32
+        assert limits["max_questions"] == configured.max_questions == 32
+        assert limits["min_choice_options"] == 2
+        assert limits["max_choice_options"] == 255
+        assert limits["min_score_levels"] == 2
+        assert limits["max_score_levels"] == 10
+        assert limits["overflow_policy"] == "reject"
+        assert limits["max_request_chars"] == configured.effective_max_request_chars
+        assert limits["request_deadline_seconds"] == 30.0
+        assert limits["max_pending_requests"] == 8
+
+    def test_the_bundle_token_limits_come_from_the_manifest(
+        self, client: TestClient
+    ) -> None:
+        # The per-bundle values are the ones the request path enforces, and POC_DESIGN
+        # 5.5 requires them to be published rather than assumed from spec 4.2.
+        bundle = client.get("/jevbert/v1/capabilities", headers=AUTH).json()["bundles"][0]
+        assert bundle["limits"] == {
+            "max_sequence_tokens": 2048,
+            "max_request_tokens": 131_072,
+        }
+
+    def test_aliases_are_empty_unless_enabled(self, client: TestClient) -> None:
+        assert client.get("/jevbert/v1/capabilities", headers=AUTH).json()["aliases"] == {}
+
+    def test_enabled_aliases_are_published(self) -> None:
+        settings = build_settings(
+            serving=ServingSettings(allow_jev_aliases=True, aliases={"jev-latest": MODEL})
+        )
+        registry = registry_from_settings(settings)
+        with build_client(settings=settings, registry=registry) as client:
+            payload = client.get("/jevbert/v1/capabilities", headers=AUTH).json()
+        assert payload["aliases"] == {"jev-latest": MODEL}
+
+
+class TestFakeInjectionIsUnreachable:
+    """POC_DESIGN 6.2: ``logit_fn`` and the delays are constructor arguments only.
+
+    They exist so that ties, extreme values, NaN and count mismatches can be produced
+    (CT07, CT08). Nothing a caller or an operator writes may select them: a fake that
+    could be steered from a manifest or a request body would be a way to make the
+    server answer anything at all.
+    """
+
+    def test_a_manifest_cannot_carry_them(self, tmp_path: Path) -> None:
+        raw = json.loads(FAKE_MANIFEST.read_text(encoding="utf-8"))
+        for field in ("logit_fn", "delay_seconds", "load_delay_seconds"):
+            path = tmp_path / "jevbert-fake-0.0.0.json"
+            path.write_text(json.dumps(raw | {field: 5}), encoding="utf-8")
+            with pytest.raises(ConfigurationError):
+                registry_from_settings(
+                    build_settings(manifests_dir=tmp_path, enable_fake_bundle=True)
+                )
+
+    def test_a_configuration_cannot_carry_them(self) -> None:
+        for field in ("logit_fn", "delay_seconds"):
+            with pytest.raises(ValidationError):
+                ServingSettings(**{field: 5})
+            with pytest.raises(ValidationError):
+                Settings(api_keys=(API_KEY,), **{field: 5})
+
+    def test_a_request_body_cannot_carry_them(self, client: TestClient) -> None:
+        body = request_body(NOUL) | {"logit_fn": "anything"}
+        assert systemone(client, body).status_code == 422
+
+        nested = request_body({"q": {"type": "noul", "delay_seconds": 5}})
+        assert systemone(client, nested).status_code == 422
+
+    def test_the_built_fake_backend_has_neither(self) -> None:
+        registry = registry_from_settings(build_settings())
+        backend = registry.bundles[0].backend
+        assert isinstance(backend, FakeBackend)
+        # Read through the public behaviour rather than the private attributes: an
+        # injected logit_fn would change the answer, a delay would change the timing.
+        pairs = [TextPair("p", "h1"), TextPair("p", "h2")]
+        logits = backend.score(backend.count_and_encode(pairs), CancelToken())
+        assert logits == FakeBackend().score(
+            FakeBackend().count_and_encode(pairs), CancelToken()
+        )
+        assert logits[0] != logits[1]
+
+
+class TestValidationOrder:
+    """POC_DESIGN 3 / D3: the gates are ordered, and the order is observable."""
+
+    def test_media_type_is_checked_before_size(self, client: TestClient) -> None:
+        # Both are wrong; 415 is the one the caller is told about, because the body is
+        # never interpreted as JSON at all.
+        response = client.post(
+            "/v1/systemone",
+            content=b"x" * (3 * 1024 * 1024),
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "text/plain"},
+        )
+        assert response.status_code == 415
+        assert response.json()["error"]["code"] == "unsupported_media_type"
+
+    def test_size_is_checked_before_parsing(self, client: TestClient) -> None:
+        response = systemone(client, content=b"{" + b"x" * (3 * 1024 * 1024))
+        assert response.status_code == 413
+
+    def test_structure_is_checked_before_the_model_is_resolved(
+        self, client: TestClient
+    ) -> None:
+        body = request_body({"q": {"type": "boolean"}})
+        body["model"] = "not-a-registered-bundle"
+        payload = systemone(client, body).json()
+        assert payload["error"]["code"] == "validation_error"
+
+    def test_an_unknown_model_is_refused_before_readiness(self) -> None:
+        # D3: readiness is a property of a bundle, so a name that resolves to no
+        # bundle is 422, never 503, whether or not anything has loaded.
+        registry = build_registry(load=False)
+        with build_client(registry=registry) as client:
+            body = request_body(NOUL)
+            body["model"] = "jev-1.13.0"
+            response = systemone(client, body)
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "model_not_found"
+            # The same request against a registered bundle is the 503 case.
+            assert systemone(client, request_body(NOUL)).status_code == 503
+
 
 class TestReadiness:
     def test_not_ready_until_bundles_load(self) -> None:
@@ -228,44 +366,154 @@ class TestReadiness:
             assert "sha256:" not in client.get("/readyz").text
             assert client.get("/healthz").json() == {"status": "ok"}
 
+    def test_model_unavailable_is_marked_retryable(self) -> None:
+        registry = build_registry(load=False)
+        with build_client(registry=registry) as client:
+            payload = systemone(client, request_body(NOUL)).json()
+        assert payload["error"]["code"] == "model_unavailable"
+        assert payload["error"]["retryable"] is True
+
+    def test_the_production_startup_path_is_unready_and_then_ready(self) -> None:
+        # Every other readiness test drives registry.load_all() by hand. This one uses
+        # the path the server actually takes: create_app(load_on_startup=True) with a
+        # backend that takes a moment, so the 503 window is real rather than staged.
+        registry = build_registry(FakeBackend(load_delay_seconds=0.3), load=False)
+        settings = build_settings()
+        app = create_app(settings, registry, load_on_startup=True)
+        with TestClient(app) as client:
+            assert client.get("/readyz").status_code == 503
+            response = systemone(client, request_body(NOUL))
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "model_unavailable"
+
+            deadline = time.monotonic() + 10.0
+            while client.get("/readyz").status_code != 200:
+                assert time.monotonic() < deadline, "the bundle never became ready"
+                time.sleep(0.02)
+            assert systemone(client, request_body(NOUL)).status_code == 200
+
+    def test_warmup_runs_on_the_engine_worker(self) -> None:
+        # A-F10: a warmup forward pass on the loading thread would touch the device
+        # beside whatever the worker is serving.
+        threads: list[str] = []
+
+        class Observing(FakeBackend):
+            def score(self, sequences: Any, cancel: CancelToken) -> list[float]:
+                if all(s.data.premise == WARMUP_PREMISE for s in sequences):
+                    threads.append(threading.current_thread().name)
+                return super().score(sequences, cancel)
+
+        registry = build_registry(Observing(), load=False)
+        app = create_app(build_settings(), registry, load_on_startup=True)
+        with TestClient(app) as client:
+            deadline = time.monotonic() + 10.0
+            while client.get("/readyz").status_code != 200:
+                assert time.monotonic() < deadline, "the bundle never became ready"
+                time.sleep(0.02)
+
+        assert threads and all(name.startswith("jevbert-inference") for name in threads)
+
+
+class GatedBackend(FakeBackend):
+    """Blocks inside ``score`` until the test lets it go.
+
+    The 529 tests used to race two requests against a one-second sleep and hope the
+    scheduler cooperated. A rendezvous makes "the worker is busy" a fact rather than a
+    guess, and takes the sleep out of the suite.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self._release = threading.Event()
+
+    def score(self, sequences: Any, cancel: CancelToken) -> list[float]:
+        if any(sequence.data.premise != WARMUP_PREMISE for sequence in sequences):
+            self.started.set()
+            assert self._release.wait(10.0), "the gated backend was never released"
+        return super().score(sequences, cancel)
+
+    def release(self) -> None:
+        self._release.set()
+
 
 class TestOverloadAndDeadline:
     def test_queue_full_returns_529(self) -> None:
         settings = build_settings(serving=ServingSettings(max_pending_requests=1))
-        registry = build_registry(FakeBackend(delay_seconds=1.0))
-        with build_client(settings=settings, registry=registry) as client:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [
-                    pool.submit(systemone, client, request_body(NOUL)) for _ in range(2)
-                ]
-                statuses = sorted(future.result().status_code for future in futures)
-        assert statuses == [200, 529]
+        backend = GatedBackend()
+        with build_client(settings=settings, registry=build_registry(backend)) as client:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                busy = pool.submit(systemone, client, request_body(NOUL))
+                assert backend.started.wait(10.0)
+                refused = systemone(client, request_body(NOUL))
+                backend.release()
+                assert busy.result().status_code == 200
+        assert refused.status_code == 529
 
     def test_529_carries_retry_after_and_is_marked_retryable(self) -> None:
         settings = build_settings(serving=ServingSettings(max_pending_requests=1))
-        registry = build_registry(FakeBackend(delay_seconds=1.0))
-        with build_client(settings=settings, registry=registry) as client:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [
-                    pool.submit(systemone, client, request_body(NOUL)) for _ in range(2)
-                ]
-                responses = [future.result() for future in futures]
-        overloaded = [r for r in responses if r.status_code == 529]
-        assert len(overloaded) == 1
-        payload = overloaded[0].json()
+        backend = GatedBackend()
+        with build_client(settings=settings, registry=build_registry(backend)) as client:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                busy = pool.submit(systemone, client, request_body(NOUL))
+                assert backend.started.wait(10.0)
+                refused = systemone(client, request_body(NOUL))
+                backend.release()
+                busy.result()
+
+        payload = refused.json()
+        assert refused.status_code == 529
         assert payload["error"]["code"] == "overloaded"
         assert payload["error"]["retryable"] is True
-        assert overloaded[0].headers["Retry-After"] == "1"
+        assert refused.headers["Retry-After"] == "1"
+
+    def test_capacity_returns_once_the_worker_finishes(self) -> None:
+        settings = build_settings(serving=ServingSettings(max_pending_requests=1))
+        backend = GatedBackend()
+        with build_client(settings=settings, registry=build_registry(backend)) as client:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                busy = pool.submit(systemone, client, request_body(NOUL))
+                assert backend.started.wait(10.0)
+                assert systemone(client, request_body(NOUL)).status_code == 529
+                backend.release()
+                assert busy.result().status_code == 200
+            # A 529 is a statement about right now, not a latch.
+            assert systemone(client, request_body(NOUL)).status_code == 200
 
     def test_deadline_returns_504(self) -> None:
         settings = build_settings(serving=ServingSettings(request_deadline_seconds=0.05))
-        registry = build_registry(FakeBackend(delay_seconds=5.0))
-        with build_client(settings=settings, registry=registry) as client:
-            response = systemone(client, request_body(NOUL))
-        assert response.status_code == 504
-        payload = response.json()
-        assert payload["error"]["code"] == "deadline_exceeded"
-        assert payload["error"]["retryable"] is True
+        backend = GatedBackend()
+        try:
+            with build_client(settings=settings, registry=build_registry(backend)) as client:
+                response = systemone(client, request_body(NOUL))
+                # Still inside the backend: the 504 is produced while the work is
+                # genuinely in flight, not after it quietly finished.
+                assert backend.started.is_set()
+                assert response.status_code == 504
+                payload = response.json()
+                assert payload["error"]["code"] == "deadline_exceeded"
+                assert payload["error"]["retryable"] is True
+        finally:
+            backend.release()
+
+    def test_the_cancel_token_reaches_a_backend_that_watches_it(self) -> None:
+        # CT10: a request that gave up must stop the work, not just stop waiting.
+        observed = threading.Event()
+
+        class Watchful(FakeBackend):
+            def score(self, sequences: Any, cancel: CancelToken) -> list[float]:
+                if any(s.data.premise != WARMUP_PREMISE for s in sequences):
+                    for _ in range(1000):
+                        if cancel.cancelled:
+                            observed.set()
+                            raise InferenceCancelled()
+                        time.sleep(0.01)
+                return super().score(sequences, cancel)
+
+        settings = build_settings(serving=ServingSettings(request_deadline_seconds=0.05))
+        with build_client(settings=settings, registry=build_registry(Watchful())) as client:
+            assert systemone(client, request_body(NOUL)).status_code == 504
+            assert observed.wait(10.0)
 
 
 class TestErrorContract:
@@ -329,13 +577,22 @@ class TestHeaders:
         assert headers["X-JevBERT-Usage"] == "expanded-input-a0-v1"
         assert headers["X-JevBERT-Calibration"] == "uncalibrated"
 
+    @pytest.mark.parametrize(
+        "header", ["X-JevBERT-Bundle", "X-JevBERT-Usage", "X-JevBERT-Calibration"]
+    )
     def test_bundle_headers_are_omitted_before_a_bundle_is_known(
-        self, client: TestClient
+        self, client: TestClient, header: str
     ) -> None:
+        # POC_DESIGN 4.4: all three describe a bundle, so none of them may carry a
+        # default when the request failed before one was resolved.
         response = systemone(client, request_body({}))
         assert response.status_code == 422
-        assert "X-JevBERT-Bundle" not in response.headers
+        assert header not in response.headers
+
+    def test_the_contract_headers_are_present_even_then(self, client: TestClient) -> None:
+        response = systemone(client, request_body({}))
         assert response.headers["X-JevBERT-Contract"] == CONTRACT_PROFILE
+        assert response.headers["x-typesafe-request-id"]
 
     @pytest.mark.parametrize("path", ["/healthz", "/readyz", "/nope"])
     def test_every_response_carries_a_request_id(self, client: TestClient, path: str) -> None:

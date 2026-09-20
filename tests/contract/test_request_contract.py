@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import MODEL, request_body, systemone
+from jevbert.backends.fake import FakeBackend
+from jevbert.compiler.serializer_nli import compile_request
+from jevbert.config import Limits
+from jevbert.contracts.validator import validate_request
+from jevbert.inference.registry import Bundle, BundleLimits, ModelRegistry, read_manifest
+from tests.conftest import (
+    FAKE_MANIFEST,
+    MODEL,
+    build_client,
+    build_registry,
+    request_body,
+    systemone,
+)
+
+#: Distinguishes "the key is absent" from "the key is present and null"; the two are
+#: treated alike by the contract but only one of them is what SDK 0.7.0 sends (U01).
+OMITTED = object()
 
 
 def _ok(client: TestClient, questions: dict[str, Any], state: Any = "s") -> dict[str, Any]:
@@ -106,14 +124,39 @@ class TestCT03OptionalFields:
         assert set(payload["answers"]["q"]["probabilities"]) == {"a", "b"}
 
     @pytest.mark.parametrize(
-        "criteria", [None, {}, {"true": "はい"}, {"false": "いいえ"}, {"true": None}]
+        "criteria",
+        [OMITTED, None, {}, {"true": "はい"}, {"false": "いいえ"}, {"true": None}],
+        ids=["omitted", "null", "empty", "true-only", "false-only", "true-null"],
     )
     def test_noul_criteria_variants(self, client: TestClient, criteria: Any) -> None:
+        # The omitted case used to be unreachable: `if criteria is not None or True`
+        # is always true, so `criteria: null` was sent six times and the "no criteria
+        # key at all" shape - the one SDK 0.7.0 actually produces - was never tested.
         question: dict[str, Any] = {"type": "noul"}
-        if criteria is not None or True:
+        if criteria is not OMITTED:
             question["criteria"] = criteria
         payload = _ok(client, {"q": question})
         assert "confidence" not in payload["answers"]["q"]  # I08
+        assert set(payload["answers"]["q"]) == {"type", "noul"}
+
+    def test_omitted_and_null_criteria_give_the_same_answer(
+        self, client: TestClient
+    ) -> None:
+        omitted = _ok(client, {"q": {"type": "noul"}})
+        explicit = _ok(client, {"q": {"type": "noul", "criteria": None}})
+        empty = _ok(client, {"q": {"type": "noul", "criteria": {}}})
+        assert omitted["answers"] == explicit["answers"] == empty["answers"]
+
+    def test_a_one_sided_criterion_changes_only_that_side(
+        self, client: TestClient
+    ) -> None:
+        # The default sentence stands in for the missing side (spec 5.4), so naming
+        # one side must move the answer rather than be ignored.
+        default = _ok(client, {"q": {"type": "noul"}})["answers"]["q"]["noul"]
+        one_sided = _ok(
+            client, {"q": {"type": "noul", "criteria": {"true": "返金を求めている"}}}
+        )["answers"]["q"]["noul"]
+        assert one_sided != default
 
     def test_absent_and_null_instructions_give_the_same_answer(self, client: TestClient) -> None:
         # U01: SDK 0.7.0 omits unset fields; both forms must mean "no extra guidance".
@@ -134,6 +177,9 @@ class TestCT04OptionCountBoundaries:
         criteria = {f"k{i:03d}": None for i in range(count)}
         response = systemone(client, request_body({"q": {"type": "choice", "criteria": criteria}}))
         assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["questions", "q", "criteria"]
 
     @pytest.mark.parametrize("count", [2, 10])
     def test_accepted_score_counts(self, client: TestClient, count: int) -> None:
@@ -146,20 +192,49 @@ class TestCT04OptionCountBoundaries:
         criteria = [f"level {i}" for i in range(count)]
         response = systemone(client, request_body({"q": {"type": "score", "criteria": criteria}}))
         assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["questions", "q", "criteria"]
+
+    def test_a_null_score_level_is_refused_at_its_index(self, client: TestClient) -> None:
+        # U02: the Advanced docs allow a null level; this server does not, and says
+        # which level it objected to.
+        criteria = ["low", None, "high"]
+        response = systemone(client, request_body({"q": {"type": "score", "criteria": criteria}}))
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["questions", "q", "criteria", 1]
 
 
 class TestCT05MalformedInput:
     def test_empty_questions(self, client: TestClient) -> None:
-        assert systemone(client, request_body({})).status_code == 422
+        response = systemone(client, request_body({}))
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["questions"]
 
     def test_unknown_question_type(self, client: TestClient) -> None:
         response = systemone(client, request_body({"q": {"type": "boolean"}}))
         assert response.status_code == 422
-        assert response.json()["error"]["path"] == ["questions", "q", "type"]
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["questions", "q", "type"]
 
     def test_unknown_top_level_field(self, client: TestClient) -> None:
         body = request_body({"q": {"type": "noul"}}) | {"temperature": 0.7}
-        assert systemone(client, body).status_code == 422
+        response = systemone(client, body)
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "validation_error"
+        assert payload["error"]["path"] == ["temperature"]
+
+    def test_unknown_question_field(self, client: TestClient) -> None:
+        body = request_body({"q": {"type": "noul", "threshold": 0.5}})
+        response = systemone(client, body)
+        assert response.status_code == 422
+        assert response.json()["error"]["path"] == ["questions", "q", "threshold"]
 
     @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "1e999"])
     def test_non_finite_numbers(self, client: TestClient, literal: str) -> None:
@@ -211,20 +286,73 @@ class TestCT05MalformedInput:
 
 
 class TestCT06Limits:
-    def test_depth_at_the_limit(self, client: TestClient) -> None:
-        nested: Any = "leaf"
-        for _ in range(29):
-            nested = [nested]
-        # body(1) + state(1) + 29 arrays = 31 levels, inside the limit of 32.
-        assert systemone(client, request_body({"q": {"type": "noul"}}, nested)).status_code == 200
+    @staticmethod
+    def _body_nested(levels: int) -> dict[str, Any]:
+        """A body whose deepest point is exactly ``levels``.
 
-    def test_depth_above_the_limit(self, client: TestClient) -> None:
+        The body object is level 1 and each array around the state adds one, so
+        ``levels`` needs ``levels - 1`` arrays. The questions branch is only three
+        levels deep and never competes.
+        """
         nested: Any = "leaf"
-        for _ in range(40):
+        for _ in range(levels - 1):
             nested = [nested]
-        response = systemone(client, request_body({"q": {"type": "noul"}}, nested))
+        return request_body({"q": {"type": "noul"}}, nested)
+
+    def test_depth_exactly_at_the_limit(self, client: TestClient) -> None:
+        assert systemone(client, self._body_nested(32)).status_code == 200
+
+    def test_depth_one_past_the_limit(self, client: TestClient) -> None:
+        response = systemone(client, self._body_nested(33))
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "validation_error"
+
+    def test_depth_far_past_the_limit(self, client: TestClient) -> None:
+        # Well past Python's recursion limit, and assembled as raw bytes because any
+        # recursive encoder would give up first. The depth is counted on the raw text
+        # before the decoder ever sees it, which is the whole point (POC_DESIGN 4.1).
+        depth = 5_000
+        raw = (
+            f'{{"model":"{MODEL}","state":'.encode()
+            + b"[" * depth
+            + b'"leaf"'
+            + b"]" * depth
+            + b',"questions":{"q":{"type":"noul"}}}'
+        )
+        response = systemone(client, content=raw)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_error"
+
+    def test_sequence_tokens_exactly_at_the_limit(self, client: TestClient) -> None:
+        # The fake backend counts UTF-8 bytes plus four special tokens, and the longer
+        # of the two Noul defaults ("...is yes.") is 34 bytes: 2010 + 34 + 4 is exactly
+        # the 2048 the manifest declares.
+        response = systemone(client, request_body({"q": {"type": "noul"}}, "x" * 2010))
+        assert response.status_code == 200, response.text
+
+    def test_sequence_tokens_one_past_the_limit(self, client: TestClient) -> None:
+        response = systemone(client, request_body({"q": {"type": "noul"}}, "x" * 2011))
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"]["code"] == "context_length_exceeded"
+        assert payload["error"]["path"] == ["questions", "q"]
+
+    def test_request_tokens_exactly_at_the_limit(self) -> None:
+        # 10 characters of state: (10+33+4) + (10+34+4) = 95 tokens across both
+        # candidates, which is what a request budget of 95 must still accept.
+        with _client_with_budget(max_request_tokens=95) as client:
+            response = systemone(client, request_body({"q": {"type": "noul"}}, "x" * 10))
+            assert response.status_code == 200, response.text
+            assert response.json()["usage"]["input_tokens"] == 95
+
+    def test_request_tokens_one_past_the_limit(self) -> None:
+        with _client_with_budget(max_request_tokens=94) as client:
+            response = systemone(client, request_body({"q": {"type": "noul"}}, "x" * 10))
+            assert response.status_code == 422
+            payload = response.json()
+            assert payload["error"]["code"] == "context_length_exceeded"
+            # The request as a whole is too long, so no single question is named.
+            assert "path" not in payload["error"]
 
     @staticmethod
     def _body_of_exactly(size: int) -> bytes:
@@ -270,3 +398,92 @@ class TestCT06Limits:
         assert response.status_code == 200
         # (1 + 1 + 4) + (1 + 2 + 4) = 13, nothing truncated.
         assert response.json()["usage"]["input_tokens"] == 13
+
+
+class TestCandidateKeyOrdering:
+    """Code point order for the model, request order for the wire (POC_DESIGN 5.2)."""
+
+    KEYS = ("😀", "z", "ア", "あ")
+
+    def test_the_model_sees_candidates_in_code_point_order(self) -> None:
+        compiled = _compile(dict.fromkeys(self.KEYS))
+        assert compiled.option_keys == tuple(sorted(self.KEYS))
+        assert compiled.option_keys == ("z", "あ", "ア", "😀")
+        # Sorting is by code point, not by any locale or normalisation rule.
+        assert [ord(key[0]) for key in compiled.option_keys] == sorted(
+            ord(key[0]) for key in self.KEYS
+        )
+
+    def test_the_wire_keeps_the_request_order(self, client: TestClient) -> None:
+        criteria = dict.fromkeys(self.KEYS)
+        response = systemone(
+            client, request_body({"q": {"type": "choice", "criteria": criteria}})
+        )
+        ordered = json.loads(response.text, object_pairs_hook=list)
+        answers = dict(dict(ordered)["answers"])
+        probabilities = dict(answers["q"])["probabilities"]
+        assert [key for key, _ in probabilities] == list(self.KEYS)
+
+    def test_a_tie_resolves_to_the_smallest_key(self) -> None:
+        # Equal logits for every candidate leave the tie-break as the only thing that
+        # can decide the answer (spec 5.4, CT07).
+        criteria = dict.fromkeys(self.KEYS)
+        backend = FakeBackend(logit_fn=lambda pairs: [1.0] * len(pairs))
+        registry = build_registry(backend)
+        with build_client(registry=registry) as client:
+            payload = systemone(
+                client, request_body({"q": {"type": "choice", "criteria": criteria}})
+            ).json()
+        answer = payload["answers"]["q"]
+        assert set(answer["probabilities"].values()) == {0.25}
+        assert answer["choice"] == min(self.KEYS) == "z"
+        assert answer["confidence"] == 0.0
+
+    def test_nfc_and_nfd_are_different_candidates(self, client: TestClient) -> None:
+        # No Unicode normalisation anywhere (spec 6.1): two spellings of the same
+        # glyph are two options, kept apart and both answered for.
+        nfc, nfd = "が", "が"
+        assert nfc != nfd and len(nfc) != len(nfd)
+        criteria = {nfc: None, nfd: None}
+        response = systemone(
+            client, request_body({"q": {"type": "choice", "criteria": criteria}})
+        )
+        assert response.status_code == 200
+        probabilities = response.json()["answers"]["q"]["probabilities"]
+        assert set(probabilities) == {nfc, nfd}
+
+    def test_nfc_and_nfd_reach_the_model_as_written(self) -> None:
+        nfc, nfd = "が", "が"
+        compiled = _compile({nfc: None, nfd: None})
+        hypotheses = [pair.hypothesis for pair in compiled.pairs]
+        assert sorted(hypotheses) == sorted([nfc, nfd])
+
+    def test_an_empty_key_keeps_its_place_in_the_order(self) -> None:
+        compiled = _compile({"": None, "a": None})
+        assert compiled.option_keys == ("", "a")
+
+
+def _compile(criteria: dict[str, Any]) -> Any:
+    body = {
+        "model": MODEL,
+        "state": "s",
+        "questions": {"q": {"type": "choice", "criteria": criteria}},
+    }
+    return compile_request(validate_request(body, Limits())).questions[0]
+
+
+@contextmanager
+def _client_with_budget(*, max_request_tokens: int) -> Iterator[TestClient]:
+    """A client whose bundle declares a deliberately tiny token budget."""
+    manifest, digest = read_manifest(FAKE_MANIFEST)
+    narrowed = manifest.model_copy(
+        update={
+            "limits": BundleLimits(
+                max_sequence_tokens=2048, max_request_tokens=max_request_tokens
+            )
+        }
+    )
+    registry = ModelRegistry([Bundle(narrowed, digest, FakeBackend())])
+    registry.load_all()
+    with build_client(registry=registry) as client:
+        yield client

@@ -6,6 +6,7 @@ import json
 import math
 from typing import Any
 
+import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
@@ -34,6 +35,10 @@ SMALL_LOGITS = st.lists(
     max_size=10,
 )
 
+#: A perfectly flat distribution computes 1 - H/log K to within a summation ulp of
+#: zero, not to zero itself, so "flat" is read at this scale rather than exactly.
+FLAT_CONFIDENCE = 1e-12
+
 
 class TestPT01Distributions:
     @given(LOGITS)
@@ -50,13 +55,32 @@ class TestPT01Distributions:
         assert 0.0 <= confidence <= 1.0
 
     @given(LOGITS)
-    def test_confidence_is_zero_only_for_a_flat_distribution(
+    def test_confidence_is_zero_exactly_when_the_distribution_is_flat(
         self, logits: list[float]
     ) -> None:
+        # The definition (spec 8.2) is 1 - H/log K, so a zero says "no concentration
+        # at all" and nothing else. The old assertion here only fired when confidence
+        # exceeded 0.5, which every non-degenerate distribution satisfies anyway.
+        #
+        # Both directions need a tolerance: a uniform vector of 24 entries sums its
+        # entropy to within one ulp of log K, which lands a hair either side of zero.
         p = probabilities_from_logits(logits)
         confidence = normalized_entropy_confidence(p)
-        if confidence > 0.5:
-            assert max(p) > 1.0 / len(p)
+        spread = max(p) - min(p)
+        if spread == 0.0:
+            assert confidence <= FLAT_CONFIDENCE
+        if confidence <= FLAT_CONFIDENCE:
+            assert spread <= 1e-9
+
+    @given(st.integers(min_value=2, max_value=64), st.floats(min_value=-20, max_value=20))
+    def test_equal_logits_give_a_confidence_of_zero(self, count: int, logit: float) -> None:
+        p = probabilities_from_logits([logit] * count)
+        assert normalized_entropy_confidence(p) <= FLAT_CONFIDENCE
+
+    @given(st.integers(min_value=2, max_value=32))
+    def test_a_one_hot_distribution_gives_a_confidence_of_one(self, count: int) -> None:
+        p = probabilities_from_logits([1e4] + [-1e4] * (count - 1))
+        assert normalized_entropy_confidence(p) == pytest.approx(1.0, abs=1e-12)
 
     @given(LOGITS)
     def test_choice_selects_the_argmax_with_code_point_tie_break(
@@ -102,23 +126,60 @@ class TestPT01Distributions:
         assert noul_probability([z_false, z_false + gap]) > 0.5
         assert noul_probability([z_false, z_false - gap]) < 0.5
 
-    @given(LOGITS, st.floats(min_value=0.1, max_value=10.0))
+    @given(SMALL_LOGITS, st.floats(min_value=0.1, max_value=10.0))
     def test_temperature_preserves_the_ordering(
         self, logits: list[float], temperature: float
     ) -> None:
+        # The old version of this test sorted a list and asserted it was sorted, which
+        # is true of every list. The property that matters is that scaling never
+        # reorders candidates: a temperature change may flatten or sharpen the
+        # distribution but must not change which option wins.
         base = probabilities_from_logits(logits)
         scaled = probabilities_from_logits(logits, temperature)
-        order = sorted(range(len(logits)), key=base.__getitem__)
-        scaled_order = sorted(range(len(logits)), key=scaled.__getitem__)
-        assert [base[i] for i in order] == sorted(base)
-        assert [scaled[i] for i in scaled_order] == sorted(scaled)
+        for i in range(len(logits)):
+            for j in range(len(logits)):
+                if logits[i] < logits[j]:
+                    assert base[i] <= base[j]
+                    assert scaled[i] <= scaled[j]
+
+    @given(SMALL_LOGITS, st.floats(min_value=1.0, max_value=10.0))
+    def test_raising_the_temperature_never_raises_confidence(
+        self, logits: list[float], temperature: float
+    ) -> None:
+        # A higher temperature flattens the distribution, so the concentration
+        # statistic cannot go up. This is the direction calibration would move it.
+        base = normalized_entropy_confidence(probabilities_from_logits(logits))
+        hotter = normalized_entropy_confidence(
+            probabilities_from_logits(logits, temperature)
+        )
+        assert hotter <= base + 1e-9
+
+    @given(SMALL_LOGITS, st.floats(min_value=0.1, max_value=1.0))
+    def test_lowering_the_temperature_never_lowers_confidence(
+        self, logits: list[float], temperature: float
+    ) -> None:
+        base = normalized_entropy_confidence(probabilities_from_logits(logits))
+        colder = normalized_entropy_confidence(
+            probabilities_from_logits(logits, temperature)
+        )
+        assert colder >= base - 1e-9
 
     @given(st.lists(st.floats(min_value=-10, max_value=10), min_size=2, max_size=20))
     def test_select_choice_agrees_with_the_distribution(self, logits: list[float]) -> None:
+        # "in keys" cannot fail: select_choice returns one of the keys it was given.
+        # The contract is argmax with a code point tie-break (I05, spec 5.4).
         assume(all(math.isfinite(v) for v in logits))
         keys = [f"key{i}" for i in range(len(logits))]
         probabilities = dict(zip(keys, probabilities_from_logits(logits), strict=True))
-        assert select_choice(probabilities) in keys
+        best = max(probabilities.values())
+        expected = min(key for key, value in probabilities.items() if value == best)
+        assert select_choice(probabilities) == expected
+
+    @given(st.lists(st.sampled_from(["a", "z", "あ", "ア", "😀"]), min_size=2, max_size=5))
+    def test_ties_resolve_to_the_smallest_key_by_code_point(self, keys: list[str]) -> None:
+        assume(len(set(keys)) == len(keys))
+        probabilities = dict.fromkeys(keys, 1.0 / len(keys))
+        assert select_choice(probabilities) == min(keys)
 
 
 class TestPT05CanonicalJson:

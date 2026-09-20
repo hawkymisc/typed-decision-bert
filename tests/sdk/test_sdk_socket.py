@@ -7,9 +7,12 @@ response the server actually sent: the SDK retries 408, 429 and every 5xx by def
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from typesafe_sdk import (
     AsyncTypeSafeClient,
     Choice,
@@ -25,7 +28,11 @@ from typesafe_sdk import (
     TypeSafeUnprocessableEntityError,
 )
 
-from tests.conftest import API_KEY, MODEL
+from jevbert.backends.base import WARMUP_PREMISE, CancelToken
+from jevbert.backends.fake import FakeBackend
+from jevbert.config import ServingSettings
+from tests.conftest import API_KEY, MODEL, build_settings
+from tests.sdk.conftest import make_app, running_server
 
 NO_RETRY = RetryPolicy(max_retries=0)
 
@@ -182,6 +189,64 @@ class TestSyncErrors:
         assert excinfo.value.status == 503
         assert excinfo.value.request_id
 
+    def test_overload_surfaces_as_529_through_the_same_exception(self) -> None:
+        # The three statuses an operator most needs to tell apart are the three the
+        # SDK collapses into one type, so the distinction is worth a test each.
+        backend = GatedBackend()
+        settings = build_settings(serving=ServingSettings(max_pending_requests=1))
+        app = make_app(backend=backend, settings=settings)
+        with running_server(app) as url, ThreadPoolExecutor(max_workers=1) as pool:
+            busy = pool.submit(_ask, url)
+            assert backend.started.wait(10.0)
+            with client_for(url) as client:
+                with pytest.raises(TypeSafeInternalServerError) as excinfo:
+                    client.system_one(state="s", questions={"q": Noul()})
+            backend.release()
+            busy.result()
+
+        assert excinfo.value.status == 529
+        assert excinfo.value.request_id
+
+    def test_a_deadline_surfaces_as_504_through_the_same_exception(self) -> None:
+        backend = GatedBackend()
+        settings = build_settings(
+            serving=ServingSettings(request_deadline_seconds=0.05)
+        )
+        app = make_app(backend=backend, settings=settings)
+        try:
+            with running_server(app) as url, client_for(url) as client:
+                with pytest.raises(TypeSafeInternalServerError) as excinfo:
+                    client.system_one(state="s", questions={"q": Noul()})
+                assert backend.started.is_set()
+        finally:
+            backend.release()
+
+        assert excinfo.value.status == 504
+        assert excinfo.value.request_id
+
+
+class GatedBackend(FakeBackend):
+    """Holds one request inside ``score`` so that "busy" is a fact, not a race."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self._release = threading.Event()
+
+    def score(self, sequences: Any, cancel: CancelToken) -> list[float]:
+        if any(sequence.data.premise != WARMUP_PREMISE for sequence in sequences):
+            self.started.set()
+            assert self._release.wait(20.0), "the gated backend was never released"
+        return super().score(sequences, cancel)
+
+    def release(self) -> None:
+        self._release.set()
+
+
+def _ask(url: str) -> None:
+    with client_for(url) as client:
+        client.system_one(state="s", questions={"q": Noul()})
+
 
 class TestAsyncClient:
     async def test_three_types_mixed(self, server_url: str) -> None:
@@ -238,5 +303,9 @@ class TestStrictValidationObservations:
 
     def test_strict_mode_rejects_a_string_where_a_float_is_declared(self) -> None:
         raw = b'{"type":"noul","noul":"0.5"}'
-        with pytest.raises(Exception, match="noul"):
+        with pytest.raises(ValidationError) as excinfo:
             NoulAnswer.model_validate_json(raw)
+        # The SDK validates with pydantic, so the rejection is a pydantic
+        # ValidationError naming the field - not just "some exception happened".
+        assert excinfo.value.error_count() == 1
+        assert excinfo.value.errors()[0]["loc"] == ("noul",)

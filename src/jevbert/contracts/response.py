@@ -7,15 +7,15 @@ a uniform distribution or a 0.5 dressed up as an answer (spec 4.3, N02).
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from jevbert.api.errors import InferenceError
 from jevbert.compiler.compiled import EncodedRequest
 from jevbert.scoring.numeric import (
-    NOUL_OPTION_ORDER,
     choice_scores,
     expected_score,
+    normalized_entropy_confidence,
     noul_probability,
     score_scores,
     select_choice,
@@ -24,6 +24,13 @@ from jevbert.scoring.numeric import (
 #: Tolerances from spec 5.5 (I04, I06).
 SUM_TOLERANCE = 1e-6
 SCORE_TOLERANCE = 1e-6
+
+#: The confidence is recomputed from the same values in a different order, so only
+#: summation rounding separates the two; the spec sets no tolerance for it.
+CONFIDENCE_TOLERANCE = 1e-9
+
+_TOP_LEVEL_FIELDS = frozenset({"model", "answers", "usage"})
+_USAGE_FIELDS = frozenset({"input_tokens", "output_tokens"})
 
 _ANSWER_FIELDS: dict[str, frozenset[str]] = {
     "noul": frozenset({"type", "noul"}),
@@ -104,6 +111,14 @@ def _build_answer(compiled: Any, logits: Sequence[float], temperature: float) ->
 
 def verify_invariants(payload: Mapping[str, Any], encoded: EncodedRequest) -> None:
     """Check I01-I09. Any violation is a 500, never a silently shipped body."""
+    # I09 at the top level: the body carries exactly these three keys and no invented
+    # `reasoning` or `routing` beside them (A-F4).
+    if set(payload) != _TOP_LEVEL_FIELDS:
+        raise InferenceError("The response body carries fields outside the contract.")
+    model = payload["model"]
+    if not isinstance(model, str) or not model:
+        raise InferenceError("The response must name the bundle it came from.")
+
     answers = payload["answers"]
     compiled_by_id = {q.compiled.question_id: q.compiled for q in encoded.questions}
 
@@ -133,21 +148,40 @@ def verify_invariants(payload: Mapping[str, Any], encoded: EncodedRequest) -> No
         _check_probability(answer["confidence"], "confidence")
 
         # I04
-        total = math.fsum(probabilities.values())
+        values = list(probabilities.values())
+        total = math.fsum(values)
         if abs(total - 1.0) > SUM_TOLERANCE:
             raise InferenceError(f"The distribution sums to {total}, not to one.")
+
+        # The confidence is recomputed rather than trusted (A-F2). It is the one number
+        # in the body that no other invariant constrains, so a confidence that drifted
+        # from its distribution - reused, cached, or passed through from a backend that
+        # reports its own (spec 12.1) - would otherwise ship as a confident answer.
+        _check_derived(
+            answer["confidence"],
+            _derive(normalized_entropy_confidence, values, "confidence"),
+            "confidence",
+            CONFIDENCE_TOLERANCE,
+        )
 
         if compiled.question_type == "choice":
             # I05
             if answer["choice"] != select_choice(dict(probabilities)):
                 raise InferenceError("The selected choice is not the argmax of the distribution.")
         else:
-            # I06
-            values = list(probabilities.values())
-            if abs(answer["score"] - expected_score(values)) > SCORE_TOLERANCE:
-                raise InferenceError(
-                    "The score does not match the expectation of the distribution."
-                )
+            # I06. The finiteness and the range are checked first: a NaN compares false
+            # against every tolerance, so an expectation check alone would read it as
+            # "not different enough to notice" (A-F3).
+            score = answer["score"]
+            if isinstance(score, bool) or not isinstance(score, float):
+                raise InferenceError("The score must be a float.")
+            if not math.isfinite(score):
+                raise InferenceError("The score is not finite.")
+            if not 0.0 <= score <= len(values) - 1:
+                raise InferenceError("The score is outside the rubric range.")
+            _check_derived(
+                score, _derive(expected_score, values, "score"), "score", SCORE_TOLERANCE
+            )
             # I07
             legend = answer["legend"]
             if tuple(legend) != compiled.output_keys:
@@ -157,8 +191,28 @@ def verify_invariants(payload: Mapping[str, Any], encoded: EncodedRequest) -> No
                     raise InferenceError("The legend does not preserve the original rubric.")
 
     usage = payload["usage"]
+    if set(usage) != _USAGE_FIELDS:
+        raise InferenceError("The usage block carries fields outside the contract.")
     if usage["input_tokens"] != encoded.total_tokens or usage["output_tokens"] != 0:
         raise InferenceError("The usage counters do not match the compiled request.")
+
+
+def _derive(
+    reference: Callable[[Sequence[float]], float], values: Sequence[float], name: str
+) -> float:
+    """Recompute a number with the appendix C reference implementation."""
+    try:
+        return reference(values)
+    except ValueError as exc:
+        # The reference functions refuse an input they cannot work with; that is a
+        # broken body, not a value to ship (spec 4.3, N02).
+        raise InferenceError(f"The {name} could not be re-derived: {exc}") from exc
+
+
+def _check_derived(value: float, expected: float, name: str, tolerance: float) -> None:
+    """Compare a shipped number against the one the reference functions produce."""
+    if abs(value - expected) > tolerance:
+        raise InferenceError(f"The {name} does not match the distribution it came from.")
 
 
 def _check_probability(value: Any, name: str) -> None:
@@ -182,8 +236,3 @@ def _same_json(left: Any, right: Any) -> bool:
             _same_json(a, b) for a, b in zip(left, right, strict=True)
         )
     return bool(left == right)
-
-
-def noul_option_order() -> tuple[str, ...]:
-    """Exposed so that tests can assert the false/true order is never flipped."""
-    return NOUL_OPTION_ORDER

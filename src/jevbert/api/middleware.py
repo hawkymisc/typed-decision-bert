@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from traceback import extract_tb
 from typing import Any
 
 from starlette.datastructures import MutableHeaders
@@ -23,10 +24,28 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from jevbert import CONFIDENCE_DEFINITION, CONTRACT_PROFILE
 from jevbert.api.encoding import dumps
 
+#: One JSON object per request and nothing else, so that a consumer can parse every
+#: line it sees without a filter.
 logger = logging.getLogger("jevbert.access")
 
-#: Headers that only exist once a bundle has been resolved (POC_DESIGN 4.4).
-BUNDLE_HEADERS = ("X-JevBERT-Bundle", "X-JevBERT-Usage", "X-JevBERT-Calibration")
+#: Operator-facing prose about a request that failed outside the error handlers.
+error_logger = logging.getLogger("jevbert.middleware")
+
+#: Every access log line carries these keys, set or null, so that a log consumer can
+#: read one shape rather than guessing which stage a request reached (A-F1). None of
+#: them can hold state, instructions, criteria, option keys, question IDs or
+#: credentials (spec 15.2): the question counts are per type, and the bundle is a
+#: digest.
+LOG_FIELDS = (
+    "bundle",
+    "questions",
+    "sequences",
+    "input_tokens",
+    "parse_ms",
+    "compile_ms",
+    "inference_ms",
+    "error_code",
+)
 
 
 class RequestContextMiddleware:
@@ -45,7 +64,7 @@ class RequestContextMiddleware:
         state["request_id"] = request_id
         state["started_at"] = started_at
         state["extra_headers"] = {}
-        state["log"] = {}
+        state["log"] = dict.fromkeys(LOG_FIELDS)
 
         response_started = False
         status_code = 500
@@ -69,11 +88,14 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send_wrapper)
         except Exception as exc:
             # Never let a traceback or a framework body reach the client (spec 4.3).
-            logger.error(
-                "unhandled error while serving request %s: %s",
+            # Logged without exc_info: a traceback ends with the exception message, and
+            # a tokenizer, torch or validation message can quote the input (spec 15.2).
+            # The stack is reported separately, frames only (S-M2).
+            error_logger.error(
+                "unhandled error while serving request %s: error_class=%s at %s",
                 request_id,
                 type(exc).__name__,
-                exc_info=exc,
+                _failure_site(exc),
             )
             state["log"]["error_code"] = "internal_error"
             if response_started:
@@ -95,6 +117,18 @@ class RequestContextMiddleware:
         }
         record.update(state["log"])
         logger.info(dumps(record))
+
+
+def _failure_site(exc: BaseException) -> str:
+    """Where the exception was raised: file, line and function, never a message."""
+    traceback = exc.__traceback__
+    if traceback is None:
+        return "unknown"
+    frames = extract_tb(traceback)
+    if not frames:
+        return "unknown"
+    last = frames[-1]
+    return f"{last.filename}:{last.lineno} in {last.name}"
 
 
 async def _send_internal_error(send: Send, request_id: str) -> None:

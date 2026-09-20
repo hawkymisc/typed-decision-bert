@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 版 | 0.1.0（2026-09-21）。P0.5 フェーズ1（API層・contract・compiler・fake backend）時点 |
+| 版 | 0.1.1（2026-09-21）。P0.5 フェーズ1.5（レビュー指摘の反映）時点 |
 | 典拠 | [仕様書](../JevBERT_spec_design.md) §2.3, §3.3, §3.4, §5, §6；[POC_DESIGN](../docs/POC_DESIGN.md) §5.1 |
 | 参照した上流の版 | [compat/upstream/README.md](upstream/README.md) |
 
@@ -30,6 +30,8 @@
 | D06 | Choice の同率は Unicode code point 順で最小のキーを選ぶ | JevBERT の決定論的規則（仕様書 §5.4）。**Jev の同率処理との一致は未確認** |
 | D07 | 未定義パスは 404 `not_found`、非対応メソッドは 405 `method_not_allowed` を JevBERT のエラー本文で返す | フレームワーク既定の `{"detail": ...}` を露出させない（仕様書 §5.9）。実 Jev がこの 2 つを返すかは未確認 |
 | D08 | 利用者別 rate limit（429）、tenant 分離、リクエスト間 batching、TLS を実装しない | 個人 PoC の範囲（ADR-015、N18・N19・N21・N23） |
+| D09 | 認証が default-deny であり、**未認証の呼び出し側には 404・405 の代わりに 401 を返す**（`/healthz`・`/readyz` のみ無認証） | 未認証でパスの存在を列挙させない（POC_DESIGN §12.2 P-2）。認証済みなら 404・405 は D07 のとおり。実 Jev の挙動は未確認 |
+| D10 | API key は 32 文字以上でなければサーバーが起動しない | 鍵の強度を運用者の裁量に委ねない（POC_DESIGN §12.2 P-3）。JevBERT 側の運用上の決定であり、Jev の鍵形式とは無関係 |
 
 ## U: 公開資料の不一致に対する JevBERT の決定
 
@@ -51,6 +53,8 @@
 | L03 | zero-shot NLI backend（`a0-nli-zeroshot-v1`）は JevBERT の学習成果物ではない。指示追従・Score の順序性・日本語品質はいずれも**未評価** | 品質主張に使えない。G2・G3 を通過したものとして扱わない | 学習済み A1 bundle への置き換え（仕様書 §7.7、ADR-011） |
 | L04 | 候補ごとに state を繰り返すため、`usage.input_tokens` と計算量が候補数に比例する | `max_request_tokens` の実効値を 131,072 に引き上げている（仕様書 §4.2 の 32,768 は A1 の 1 質問 1 系列を前提とした値）。capabilities で公開する | A1 bundle で `expanded-input-v1` に戻る |
 | L05 | `fake-deterministic-v1` bundle は入力のハッシュを返すだけで、回答に意味はない | 設定で明示的に有効化したときだけ登録される（既定は無効）。**その出力をモデル出力として提示してはならない** | PoC 限り。contract 試験専用 |
+| L06 | `instructions` が空文字列 `""` のとき、`nli-template-v1` の「指示なし」側を使う（`"{C}"`）。`[]` と `{}` は `"[]"` / `"{}"` に描画されるので従来どおり指示として扱う | `"{I} — {C}"` に空の `I` を入れると全候補が `" — "` で始まり、モデルから見れば意味のある区切りに見える。API の構造は変わらない。**空文字列と「指示なし」を区別したい呼び出し側は区別できない**（実 Jev がどう扱うかは未確認） | A1 の `serializer-v1` は指示を `typed_json` の独立フィールドとして渡すため、空文字列がテンプレート構造に漏れない |
+| L07 | 1リクエストあたりの展開後**文字数**に上限 `max_request_chars`（既定 `4 × max_request_tokens`）がある。超過は 422 `context_length_exceeded` | A0 系は候補ごとに state と instructions を繰り返すため、小さな body が数百万文字のモデル入力に膨らむ。token 上限より手前の安価な門であり、**token 上限では受理されうるリクエストが文字数で拒否されることはほぼ無い**（係数 4 は意図的に緩い）。実 Jev にこの上限は無いと思われるが未確認 | A1 の 1質問1系列では増幅が起きないため不要になる見込み |
 
 ## 未確認事項（実 Jev 照合が必要なもの）
 

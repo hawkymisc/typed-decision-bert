@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 0.1.0（2026-09-21） |
+| 文書バージョン | 0.2.0（2026-09-21。フェーズ1.5のレビュー指摘を§12.2に反映し、本文の該当箇所を追従させた） |
 | 上位文書 | [JevBERT 仕様・設計書 v0.2.0](../JevBERT_spec_design.md)（以下「仕様書」。`§5.3`のように節を参照する） |
 | 目的 | 個人PoC用途で、Jev互換APIサーバーをこのマシン上で動作させる |
 | ステータス | 実装前に固定した設計（基準線）。実装・検証で判明した差分は第12章に追記する |
@@ -67,21 +67,25 @@ RTX 5090（Blackwell, sm_120）はCUDA 12.8以降でビルドされたPyTorchが
 ```text
 HTTP request
   -> middleware: request ID発行、応答ヘッダー付与、構造化ログ
-  -> auth: Bearer（定数時間比較）                        401
+  -> auth: Bearer（定数時間比較、default-deny。§12.2 P-2）  401
+  -> routing（/healthz・/readyz 以外は認証済みのみ到達）     404 / 405
   -> body gate: Content-Type / Content-Encoding / サイズ  415 / 413
   -> strict JSON parse: 重複キー・非有限数・不正Unicode    400
   -> contract validator: 付録A相当 + 深さ                 422 validation_error
   -> registry: model名 -> bundle（alias解決）             422 model_not_found
-  -> compiler: 正規化 -> 候補ごとの(premise, hypothesis)
-               -> token IDs（制御IDとデータの分離）       422 context_length_exceeded
-  -> engine: 有界queue -> 単一worker thread -> microbatch 529 / 503 / 504
+  -> readiness                                           503 model_unavailable
+  -> encoder thread（単一。deadline・admissionの対象）
+       compiler: 正規化 -> 文字数上限の事前判定           422 context_length_exceeded
+                 -> 候補ごとの(premise, hypothesis)
+       backend:  token IDs（制御IDとデータの分離）        422 context_length_exceeded
+  -> engine: 有界queue -> 単一worker thread -> microbatch 529 / 504
   -> backend: 候補ごとの有限logit                          500 inference_error
   -> scoring: 付録C（softmax, confidence, 期待値, tie-break）
   -> response adapter: ID・候補キー・legend復元 + 不変条件検査  500
   -> 200
 ```
 
-検証順序は上から固定する。認証前にbodyを解釈しない。1件でも無効な質問があれば推論前に全体を拒否し、部分200を返さない（§5.9）。
+検証順序は上から固定する。認証前にbodyを解釈せず、認証前にパスの存在も明かさない。1件でも無効な質問があれば推論前に全体を拒否し、部分200を返さない（§5.9）。
 
 ### 3.1 モジュール構成
 
@@ -156,9 +160,9 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
 
 ### 4.3 認証
 
-`Authorization: Bearer <key>`を、設定された鍵集合と`hmac.compare_digest`で比較する。鍵は環境変数`JEVBERT_API_KEYS`（カンマ区切り）から読む。**鍵が1つも設定されていなければサーバーは起動を拒否する**（無認証モードは設けない）。`/healthz`・`/readyz`は認証なし。ログ・エラー本文に鍵を出さない。
+`Authorization: Bearer <key>`を、設定された鍵集合と`hmac.compare_digest`で比較する。比較はbytesで行う（非ASCIIのヘッダーやASCIIでない鍵で例外にならないようにするため。§12.2 P-6）。鍵は環境変数`JEVBERT_API_KEYS`（カンマ区切り）から読む。**鍵が1つも設定されていなければサーバーは起動を拒否する**。**32文字未満の鍵でも起動を拒否する**（§12.2 P-3）。無認証モードは設けない。認証はrouting の前に立つmiddlewareで全パスに適用し、`/healthz`・`/readyz`だけを明示的なallow-listとする（default-deny、§12.2 P-2）。ログ・エラー本文・設定エラー文言に鍵を出さない。鍵は設定ファイルではなく環境変数からのみ読む。
 
-`python -m jevbert init-env`は、ランダムな鍵を生成して`.env`（gitignore対象）に書き出す。既存の`.env`は上書きしない。
+`python -m jevbert init-env`は、ランダムな鍵を生成して`.env`（gitignore対象）に書き出す。既存の`.env`は上書きしない（`O_EXCL`での排他作成。可能なら`0o600`）。
 
 ### 4.4 エンドポイント
 
@@ -170,7 +174,7 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
 | `GET /readyz` | 全bundleがready（4.6節）なら200、それ以外は503 |
 | `GET /jevbert/v1/capabilities` | 4.7節 |
 
-未定義パスは404 `not_found`、非対応メソッドは405 `method_not_allowed`。全ての応答（エラー含む）に§5.7のヘッダーを付ける。ただしbundleが決まる前に失敗した場合、`X-JevBERT-Bundle`・`X-JevBERT-Usage`・`X-JevBERT-Calibration`は省略する。
+**認証済みの呼び出し側に対しては**、未定義パスは404 `not_found`、非対応メソッドは405 `method_not_allowed`（Starletteの`Allow`ヘッダーを透過する）。未認証の呼び出し側にはいずれも401であり、パスの存在は明かさない（§12.2 P-2）。全ての応答（エラー含む）に§5.7のヘッダーを付ける。ただしbundleが決まる前に失敗した場合、`X-JevBERT-Bundle`・`X-JevBERT-Usage`・`X-JevBERT-Calibration`は省略する。`/readyz`の503本文は`{"status":"not_ready"}`だけで、bundleの詳細は認証付きの capabilities にのみ出す（§12.2 P-6）。
 
 ### 4.5 エラー
 
@@ -199,7 +203,8 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
     "validated": {"languages": [], "domains": [], "max_choice_options": "unknown", "quality": "unevaluated"}
   }],
   "aliases": {},
-  "limits": {"max_body_bytes": 2097152, "max_json_depth": 32, "max_questions": 32, "…": "…"},
+  "limits": {"max_body_bytes": 2097152, "max_json_depth": 32, "max_questions": 32,
+             "max_request_chars": 524288, "…": "…"},
   "known_differences": ["confidence is JevBERT-specific", "usage is not Jev billing tokens", "…"]
 }
 ```
@@ -254,8 +259,10 @@ premiseとhypothesisは**別々に**、`add_special_tokens=False`かつ特殊tok
 
 ### 5.5 token予算
 
-- 1系列（1候補）のtoken数 ≦ `max_sequence_tokens`（PoC既定2,048。モデル上限8,192を超える設定は起動時に拒否）
+- 1系列（1候補）のtoken数 ≦ `max_sequence_tokens`（PoC既定2,048。モデル上限8,192を超える設定は起動時に拒否。manifestの`model_max_sequence_tokens`との突合で実装する。§12.2 P-5）
 - リクエスト内の全系列の合計 ≦ `max_request_tokens`（PoC既定131,072。§4.2の32,768はA1の1質問1系列を前提とした値であり、候補ごとにstateを繰り返すA0系では同じ値だと実用的な質問数・候補数を受理できないため、PoC bundleの実効値として別に定める。capabilitiesで公開する）
+- **tokenizeの前**に文字数の上限 `max_request_chars`（既定 `4 × max_request_tokens`）を適用する。展開後の文字数合計＝`(premise長 + instructions長) × 候補数 + Σ候補長` を質問ごとに積み上げ、超過で422 `context_length_exceeded`。長さの算術だけで判定し、巨大な文字列を組み立てない（§12.2 P-1）。capabilitiesで公開する
+- manifestの上限が設定の上限を**上回る**ことは許さない（下回る＝絞り込むのは可）。上回る設定は起動時に拒否する（§12.2 P-5）
 - 超過は422 `context_length_exceeded`。**切り詰めない**（`truncation=False`）。`path`は該当質問まで。
 - `usage.input_tokens`＝全系列の実長（特殊token込み、padding除く）の合計（`expanded-input-a0-v1`）。
 
@@ -276,6 +283,10 @@ class Backend(Protocol):
 
 backendは確率・confidenceを決めない（§12.1）。logit→確率は`scoring`だけが行う。
 
+`count_and_encode`は engine の encoder スレッド（単一）から呼ばれる。A0系では1リクエストの全pairが**同一のpremise**を持つ（最大 32×255＝8,160 個）ため、**同一呼び出し内で同一premiseのtoken化は1回だけ行うべき（SHOULD）**。キャッシュは呼び出しを越えて保持しない（§15.2）。
+
+backendの生成は factory に `BackendContext`（`models_dir`・`max_batch_tokens`・`max_batch_sequences`・`device`）を渡す形にする（§12.2 P-4）。
+
 ### 6.2 `fake-deterministic-v1`
 
 logit＝`sha256(premise ‖ 0x1f ‖ hypothesis)`の先頭8バイトを`[-4, 4]`へ線形写像した値。質問ID・順序に依存しないので、不変性テスト（§13.3）がcompilerの欠陥を検出できる。token数は「UTF-8バイト数＋4」で代用する。テスト用に`logit_fn`をコンストラクタで差し替え可能にし、同率・極端値・NaN・個数不一致を注入する（API経由では注入できない）。fake bundleは設定で明示的に有効化したときだけ登録する（既定は無効）。
@@ -292,13 +303,17 @@ logit＝`sha256(premise ‖ 0x1f ‖ hypothesis)`の先頭8バイトを`[-4, 4]`
 ### 6.4 Engine（`inference/engine.py`）
 
 - GPU推論は単一の専用worker thread（`ThreadPoolExecutor(max_workers=1)`）で直列実行し、event loopを塞がない。
-- 受付中＋実行中のリクエスト数が`max_pending_requests`（既定8）に達していたら529 `overloaded`。無制限に積まない。
-- リクエストごとにdeadline（既定30秒）を設け、超過で504 `deadline_exceeded`。超過・切断時はcancel tokenを立て、未dispatchのmicrobatchを実行しない。実行済みの結果を別リクエストへ返さない（結果はリクエストごとのfutureにのみ結び付く）。
+- compileとtokenizeも**別の**単一スレッド（encoder）で実行する。tokenizerへの同時アクセスを避けるため単一であり、GPU workerと分けるのはtokenizeがGPU待ちの後ろに並ばないようにするため（§12.2 P-1）。
+- 受付中＋実行中のリクエスト数が`max_pending_requests`（既定8）に達していたら529 `overloaded`。無制限に積まない。encode待ちもこの枠で数える。
+- リクエストごとにdeadline（既定30秒）を設け、超過で504 `deadline_exceeded`。**encodeもこのdeadlineの対象**である。超過・切断時はcancel tokenを立て、未dispatchのmicrobatchを実行しない。実行済みの結果を別リクエストへ返さない（結果はリクエストごとのfutureにのみ結び付く）。
+- warmup（§4.6）も同じ2つのworkerを経由する。loader threadから直接backendを呼ぶと、実GPU backendではserve中のリクエストと並行してdeviceに触りうる（§12.2 P-8）。
 - リクエスト間のbatchingはしない（PoC）。したがって異なるリクエストが同じtensorに入ることはなく、attention・回答対応の混同は構造的に起きない。
 
 ### 6.5 Registry・manifest・bundle digest
 
-`manifests/<bundle-id>.json`に、`public_id`、`description`、`release_date`（bundleを作成した実日付）、`backend`、`source_model`（repo・revision・ファイルごとのSHA-256）、`serializer_version`（テンプレートIDを含む）、`calibration`、`confidence`、`usage_semantics`、`dtype`、`limits`、`validated_*`を持つ。**bundle digest＝manifestの`canonical_json`のSHA-256**。manifestが重み・tokenizerのhashを含むので、どれが変わってもdigestが変わる。
+`manifests/<bundle-id>.json`に、`public_id`、`description`、`release_date`（bundleを作成した実日付）、`backend`、`source_model`（repo・revision・ファイルごとのSHA-256）、`serializer_version`（テンプレートIDを含む）、`calibration`、`confidence`、`usage_semantics`、`dtype`、`limits`、`model_max_sequence_tokens`（省略可）、`validated_*`を持つ。**bundle digest＝manifestの`canonical_json`のSHA-256**。manifestが重み・tokenizerのhashを含むので、どれが変わってもdigestが変わる。
+
+起動時に、manifestの`limits.*`が`settings.limits`の同名の値を上回らないこと、`limits.max_sequence_tokens`が`model_max_sequence_tokens`を上回らないことを検査し、違反は起動を拒否する（§12.2 P-5）。
 
 `python -m jevbert fetch-model`が、固定revisionを`models/`（gitignore対象）へ取得し、ファイルhashをmanifestへ書き込む（ADR-014）。サーバーはネットワークからモデルを取得しない（`HF_HUB_OFFLINE=1`相当）。利用者が指定した任意のHF ID・URLはロードしない。
 
@@ -320,7 +335,7 @@ T（温度）はmanifestの型別値（PoCは全て1.0）。分布・score・con
 
 ### 7.1 ログ
 
-1リクエスト1行のJSON（stderr）：`request_id`、`status`、`error_code`、`bundle`、型別質問数、系列数、`input_tokens`、各段階の所要時間（parse / compile / queue / inference / total）。**state・instructions・criteria・候補キー・質問ID・認証情報は記録しない**（§15.2）。uvicornのaccess logはbodyを含まないことを確認する。
+1リクエスト1行のJSON（stderr）：`request_id`、`status`、`error_code`、`bundle`、型別質問数、系列数、`input_tokens`、各段階の所要時間（parse / compile / inference / total）。**フィールドは常に全て出力し、その段階に到達しなかったものは`null`にする**（消費側が形を1つだけ読めばよいようにするため）。`error_code`は全ての`JevBERTError`で記録し、5xxでは別途operator向けの行も出す（§12.2 P-6）。**state・instructions・criteria・候補キー・質問ID・認証情報は記録しない**（§15.2）。**例外メッセージと`exc_info`も出さない**（実tokenizer・torchの例外文言は入力テキストを含みうる。型名と`file:line`だけを出す）。uvicornのaccess logはbodyを含まないことを確認する。
 
 ---
 
@@ -490,13 +505,18 @@ compiler が (premise, hypothesis) までを担当し、token 数の計数と ID
 これにより「deadline で待つのをやめたリクエストの枠が、worker が実際に終わるまで解放されない」という
 本来の意味（§6.4「受付中＋実行中」）も正しくなる。
 
-#### D6. `count_and_encode` を event loop 上で呼んでいる
+#### D6. `count_and_encode` を event loop 上で呼んでいる（**フェーズ1.5 で撤回**）
 
 token 予算の判定（422）は engine への投入（529/504）より前でなければならないため、
 `count_and_encode` はリクエストハンドラ内、すなわち event loop 上で同期的に呼んでいる。
 tokenizer に触るのが常に単一スレッドになるので thread safety の問題は起きない一方、
 **実 tokenizer で長い入力を処理する間 event loop が塞がる**。PoC の同時実行数では許容するが、
 フェーズ2でレイテンシーを実測し、必要なら専用スレッドへ移す（その場合も 422 の判定順序は保つこと）。
+
+> **この決定はフェーズ1.5（§12.2 P-1）で撤回した。** 「PoC の同時実行数では許容する」という
+> 前提が誤りで、fake backend ですら 1.6 MB body 1 件で server 全体が約3秒止まることが
+> 実測で分かった（候補数×state の増幅、S-H2）。compile と encode は専用の単一スレッド
+> executor へ移し、deadline と admission の対象に含めた。判定順序は §12.2 P-1 の形で保っている。
 
 #### D7. K1（PyTorch × RTX 5090）は解決済み
 
@@ -535,3 +555,124 @@ JSON モードとも）。したがって `{"confidence": 1}` でも復元でき
 `enable_fake_bundle: true` のときだけ `manifests/jevbert-fake-0.0.0.json` を読み込む形で実装した。
 加えて、**`bundles:` に fake の manifest を書いても `enable_fake_bundle` が false なら起動を拒否する**
 （設定ミスで意味のない回答を返すサーバーが上がらないようにするため）。
+
+---
+
+### 12.2 フェーズ1.5（レビュー指摘の反映、2026-09-21）
+
+フェーズ1の成果物に対し security / architecture / QA の3系統のレビューを行い、その指摘を反映した。
+本節は**設計（本書 §3〜§9）から変えた点と、その理由**だけを記す。テストの増強（`verify_invariants` の
+分岐テスト、構造化ログの sentinel 試験、実ソケットでの body 上限試験など）は設計を変えていないので
+ここには書かない。
+
+#### P-1. token 化を event loop から外し、安価な文字数上限を前段に置いた（D6 を撤回）
+
+**変えた点**:
+
+1. `limits.max_request_chars` を新設した（既定 `4 × max_request_tokens`）。backend を呼ぶ前に、
+   全候補の「premise + instructions + 候補テキスト」の**文字数合計**が上限を超えたら
+   422 `context_length_exceeded` で拒否する。合計は `(premise長 + instructions長) × 候補数 + Σ候補長`
+   という長さの算術で求め、**巨大な文字列を作らずに判定する**。capabilities の `limits` で公開する。
+2. compile と encode を**専用の単一スレッド executor**（`jevbert-encoder`）で実行する。
+   GPU worker（`jevbert-inference`）とは別スレッドだが、いずれも単一である
+   （tokenizer への同時アクセスを避けるため）。encode もリクエスト deadline の対象であり、
+   admission（`max_pending_requests`）の枠も消費する。
+3. `backends/base.py` の `count_and_encode` docstring に、**同一呼び出し内で同一 premise の
+   token 化は1回だけ行うべき（SHOULD）**と明記した。fake backend は呼び出しごとの map で準拠する
+   （キャッシュは呼び出しを越えて保持しない。§15.2 の記録禁止と同じ理由）。
+
+**理由**: §5.2 の A0 展開は候補ごとに state を繰り返すため、最大 32 質問 × 255 候補 = 8,160 系列になる。
+D6 はこれを「PoC の同時実行数では許容する」としていたが、fake backend（`len()` を数えるだけ）ですら
+1.6 MB body 1 件で server 全体が約3秒止まった。実 tokenizer では分単位になる。さらに、テンプレートが
+instructions も候補ごとに繰り返すため、**hypothesis の構築そのもの**が候補数×instructions長 の
+メモリを要求する。したがって文字数判定は「hypothesis を組み立てる前」でなければ意味がない。
+
+**検証順序**: §3 と D3 の順序は保つ。ただし encode が admission を取るようになったため、
+529 が 422 `context_length_exceeded` より先に返ることはありうる。**「encode が終わった時点で
+token 超過なら 422」**という意味論は変えていない（token 上限は推論より前に判定される）。
+文字数上限は encode の内側（compile の直後、tokenize の前）で判定する。
+
+#### P-2. 認証を default-deny にした
+
+**変えた点**: 認証をハンドラごとの手動呼び出しから、routing の**前**に立つ middleware へ移した。
+`/healthz` と `/readyz` だけを明示的な allow-list とする。結果として **401 が 404・405 より先に返る**。
+
+**理由**: 手動呼び出しは、新しいルートを足したときに fail-open する。また 404/405 が認証より先に返ると、
+未認証の呼び出し側がパスの存在を列挙できる。§4.4 の「未定義パスは404、非対応メソッドは405」は
+**認証済みの呼び出し側に対して**の話であると読み替える。
+
+#### P-3. API key の最小長を 32 文字にした
+
+**変えた点**: 32 文字未満の鍵は起動を拒否する（`init-env` が生成する `secrets.token_urlsafe(32)` は
+43 文字なので余裕がある）。鍵の検証は pydantic の外で行い、`Settings.api_keys` は `repr=False` にした。
+YAML に `api_keys` を書くことも拒否する（鍵は環境変数のみ）。
+
+**理由**: §4.3 は「鍵が1つも設定されていなければ起動を拒否する」としか書いていなかったため、
+`k` 1文字でも起動できた。また pydantic の検証エラーメッセージは**入力値をそのまま引用する**ので、
+鍵の検証を pydantic に任せると起動失敗時のログに鍵が出る。
+
+#### P-4. backend factory に `BackendContext` を渡す
+
+**変えた点**: factory の型を `(BundleManifest, Path) -> Backend` から
+`(BundleManifest, BackendContext) -> Backend` に変えた。`BackendContext` は
+`models_dir` / `max_batch_tokens` / `max_batch_sequences` / `device` を持つ。
+`serving.device`（`auto` / `cpu` / `cuda`）を新設した。
+
+**理由**: §6.3 の microbatch 上限（`max_batch_tokens`、`max_batch_sequences`）は設定に存在したが
+**誰も読んでいなかった**。フェーズ2が `backends/nli.py` と registry の1エントリ追加だけで済むように、
+backend が必要とする設定の受け渡し口を先に作った。
+
+#### P-5. manifest は設定の上限を広げられない
+
+**変えた点**: `manifest.limits.max_sequence_tokens` / `max_request_tokens` が
+`settings.limits` の同名の値を超えていたら起動を拒否する。manifest に
+`model_max_sequence_tokens`（省略可）を追加し、`limits.max_sequence_tokens` がそれを超えていたら
+起動を拒否する。
+
+**理由**: リクエスト経路が実際に適用するのは bundle 側の上限なので、manifest が設定より大きい値を
+宣言すると、運用者が設定した上限を黙って引き上げられる。後者は §5.5 の
+「モデル上限（8,192）を超える設定は起動時に拒否」の実装であり、超過をリクエストごとの実行時失敗ではなく
+起動時の拒否にするためのもの。
+
+#### P-6. エラーと観測の細かい修正
+
+| 項目 | 変えた点 | 理由 |
+| --- | --- | --- |
+| `InferenceCancelled` | 503 ではなく **504 `deadline_exceeded`** にした | ジョブを取り消すのは deadline か切断だけであり、§5.9 の対応する code は 504 |
+| 405 | Starlette の `Allow` ヘッダーを透過する | 405 が伝えるべき唯一の情報だった |
+| 契約外の HTTP status | 素通しせず 500 `internal_error` にしてログする | §5.9 に無い code を wire に発明しない |
+| access ログ | 全フィールドを常に出力し（未到達の段階は `null`）、`error_code` を必ず含める。5xx では別途 operator 向けの行を出す | NaN logit や不変条件違反の 500 は本文が意図的に空なので、ログが唯一の証跡 |
+| 例外ログ | 例外メッセージと `exc_info` を出さず、型名と `file:line` を出す | 実 tokenizer / torch の例外文言は入力テキストを含みうる（§15.2） |
+| `/readyz` の 503 本文 | `{"status":"not_ready"}` のみ | 無認証で bundle ID と状態を開示していた。詳細は認証付き capabilities へ |
+| 重複キーの 400 本文 | キー名を引用しない | 呼び出し側のデータの反射 |
+| `.env` 生成 | `O_EXCL` + `0o600` で排他作成 | `exists()` 確認と書き込みの間の競合で運用者の鍵を上書きしうる |
+
+#### P-7. 空文字列の `instructions` は「指示なし」
+
+**変えた点**: `render(instructions)` が空文字列になる場合、テンプレートの「指示なし」側を使う。
+`[]` / `{}` はそれぞれ `"[]"` / `"{}"` に描画されるので従来どおり指示として扱う。
+
+**理由**: §5.3 のテンプレート `"{I} — {C}"` に空の `I` を入れると、全候補が `" — "` で始まる。
+モデルから見ればこれは意味のある区切りに見える。`compat/differences.md` の L06 に記録した。
+
+#### P-8. warmup を engine の worker 経由にした
+
+**変えた点**: `Bundle.load()` は engine を受け取り、warmup の `count_and_encode` を encoder スレッド、
+`score` を inference worker で実行する。fake backend は warmup の premise に対して
+`delay_seconds` を適用しない。
+
+**理由**: §4.6 の warmup は loader スレッドから直接 backend を呼んでいた。実 GPU backend では
+serve 中のリクエストと並行して device に触りうる（§6.4 の「単一 worker で直列実行」の目的に反する）。
+後者は副産物で、テストスイートの実行時間が約9秒縮んだ。
+
+#### P-9. 応答の不変条件の穴を塞いだ
+
+**変えた点**: `verify_invariants` に次を追加した。(a) `confidence` を分布から再計算して照合する、
+(b) `score` の float 性・有限性・`0 ≤ score ≤ K-1` を検査する、
+(c) トップレベルのキー集合が `{"model","answers","usage"}` であることと `model` が非空文字列であること、
+`usage` のキー集合を検査する。
+
+**理由**: `verify_invariants` を no-op にしてもフェーズ1の 499 件が全て通った。
+特に `confidence` は**他のどの不変条件にも束縛されていない唯一の数値**であり、
+再計算しなければ「分布と無関係な自信ありげな数値」が出荷されうる。
+`score` の NaN はあらゆる許容誤差比較を false にするので、期待値との突合だけでは素通りする。

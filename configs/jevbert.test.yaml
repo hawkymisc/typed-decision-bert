@@ -1,0 +1,35 @@
+# Test configuration: the fake backend only, no weights and no GPU.
+# Answers from this bundle are hashes of the input, not judgements.
+project: JevBERT
+contract_profile: jevbert-core-2026-09-21
+
+manifests_dir: ../manifests
+models_dir: ../models
+
+bundles: []
+enable_fake_bundle: true
+
+limits:
+  max_body_bytes: 2097152
+  max_json_depth: 32
+  max_questions: 32
+  min_choice_options: 2
+  max_choice_options: 255
+  min_score_levels: 2
+  max_score_levels: 10
+  max_sequence_tokens: 2048
+  max_request_tokens: 131072
+  overflow_policy: reject
+
+serving:
+  host: 127.0.0.1
+  port: 8765
+  max_pending_requests: 8
+  request_deadline_seconds: 30.0
+  max_batch_tokens: 16384
+  max_batch_sequences: 64
+  result_cache_enabled: false
+  allow_remote_model_download: false
+  raw_request_logging: false
+  allow_jev_aliases: false
+  aliases: {}

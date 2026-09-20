@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 
 import pytest
@@ -9,12 +10,14 @@ import yaml
 
 from jevbert.config import (
     API_KEYS_ENV,
+    MIN_API_KEY_LENGTH,
     ConfigurationError,
     Limits,
     Settings,
     load_api_keys,
     load_settings,
     parse_api_keys,
+    validate_api_keys,
 )
 
 BASE_CONFIG: dict[str, object] = {
@@ -24,7 +27,9 @@ BASE_CONFIG: dict[str, object] = {
     "bundles": [],
     "enable_fake_bundle": True,
 }
-ENV = {API_KEYS_ENV: "key-one,key-two"}
+KEY_ONE = "key-one-" + "a" * 32
+KEY_TWO = "key-two-" + "b" * 32
+ENV = {API_KEYS_ENV: f"{KEY_ONE},{KEY_TWO}"}
 
 
 def write_config(tmp_path: Path, **overrides: object) -> Path:
@@ -46,7 +51,76 @@ class TestApiKeys:
         assert parse_api_keys("  ,  ") == ()
 
     def test_keys_come_from_the_environment(self) -> None:
-        assert load_api_keys(ENV) == ("key-one", "key-two")
+        assert load_api_keys(ENV) == (KEY_ONE, KEY_TWO)
+
+
+class TestApiKeyStrength:
+    """S-L4: a guessable key is a configuration error, not a warning."""
+
+    def test_the_minimum_length_is_at_least_thirty_two(self) -> None:
+        assert MIN_API_KEY_LENGTH >= 32
+
+    def test_a_key_at_the_minimum_length_is_accepted(self) -> None:
+        validate_api_keys(("k" * MIN_API_KEY_LENGTH,))
+
+    def test_a_key_one_character_short_refuses_startup(self) -> None:
+        with pytest.raises(ConfigurationError):
+            validate_api_keys(("k" * (MIN_API_KEY_LENGTH - 1),))
+
+    def test_a_short_key_refuses_startup_through_the_config_loader(
+        self, tmp_path: Path
+    ) -> None:
+        path = write_config(tmp_path)
+        with pytest.raises(ConfigurationError):
+            load_settings(path, env={API_KEYS_ENV: "short"})
+
+    def test_a_long_key_beside_a_short_one_does_not_excuse_it(self, tmp_path: Path) -> None:
+        path = write_config(tmp_path)
+        with pytest.raises(ConfigurationError):
+            load_settings(path, env={API_KEYS_ENV: f"{KEY_ONE},short"})
+
+    def test_the_key_generated_by_init_env_satisfies_the_minimum(self) -> None:
+        # The generator and the gate must not drift apart (see tests/unit/test_cli.py).
+        assert len(secrets.token_urlsafe(32)) >= MIN_API_KEY_LENGTH
+
+
+class TestApiKeysNeverAppearInDiagnostics:
+    """S-L3: a key must survive neither ``repr`` nor an error message."""
+
+    def test_repr_hides_the_keys(self) -> None:
+        settings = Settings(api_keys=(KEY_ONE, KEY_TWO))
+        assert KEY_ONE not in repr(settings)
+        assert KEY_TWO not in repr(settings)
+        assert KEY_ONE not in str(settings)
+
+    def test_the_model_dump_of_a_setting_dict_is_not_a_backdoor(self) -> None:
+        # Any diagnostic that prints the settings must stay safe, so the guard is on
+        # ``repr`` of the object rather than on one call site.
+        settings = Settings(api_keys=(KEY_ONE,))
+        assert KEY_ONE not in f"{settings!r}"
+        assert KEY_ONE not in f"the configuration is {settings}"
+
+    @pytest.mark.parametrize("bad", ["sekrit", "sekrit-but-still-far-too-short"])
+    def test_a_rejected_key_is_not_quoted_back(self, bad: str) -> None:
+        with pytest.raises(ConfigurationError) as excinfo:
+            validate_api_keys((bad,))
+        assert bad not in str(excinfo.value)
+
+    def test_a_rejected_short_key_is_not_quoted_back_by_the_loader(
+        self, tmp_path: Path
+    ) -> None:
+        path = write_config(tmp_path)
+        secret = "sekrit-but-too-short"
+        with pytest.raises(ConfigurationError) as excinfo:
+            load_settings(path, env={API_KEYS_ENV: secret})
+        assert secret not in str(excinfo.value)
+
+    def test_keys_in_the_configuration_file_are_refused(self, tmp_path: Path) -> None:
+        # Keys belong in the environment; a YAML file is far more likely to be shared.
+        path = write_config(tmp_path, api_keys=[KEY_ONE])
+        with pytest.raises(ConfigurationError) as excinfo:
+            load_settings(path, env=ENV)
+        assert KEY_ONE not in str(excinfo.value)
 
 
 class TestStartupPreconditions:
@@ -63,7 +137,7 @@ class TestStartupPreconditions:
 
     def test_valid_config_loads(self, tmp_path: Path) -> None:
         settings = load_settings(write_config(tmp_path), env=ENV)
-        assert settings.api_keys == ("key-one", "key-two")
+        assert settings.api_keys == (KEY_ONE, KEY_TWO)
         assert settings.enable_fake_bundle is True
 
     def test_relative_paths_resolve_against_the_config_file(self, tmp_path: Path) -> None:

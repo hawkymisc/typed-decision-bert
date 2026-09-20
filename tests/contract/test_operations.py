@@ -270,18 +270,22 @@ class TestOverloadAndDeadline:
 
 class TestErrorContract:
     def test_unknown_path_is_a_jevbert_error(self, client: TestClient) -> None:
-        response = client.get("/nope")
+        # Credentials first: an unauthenticated caller gets a 401 and learns nothing
+        # about which paths exist (S-M3, tests/contract/test_security.py).
+        response = client.get("/nope", headers=AUTH)
         assert response.status_code == 404
         payload = response.json()
         assert payload["error"]["code"] == "not_found"
         assert "detail" not in payload  # no FastAPI default body
 
     def test_wrong_method_is_a_jevbert_error(self, client: TestClient) -> None:
-        response = client.get("/v1/systemone")
+        response = client.get("/v1/systemone", headers=AUTH)
         assert response.status_code == 405
         payload = response.json()
         assert payload["error"]["code"] == "method_not_allowed"
         assert "detail" not in payload
+        # A-F12: a 405 must say what the path does accept.
+        assert response.headers["Allow"] == "POST"
 
     def test_error_body_shape(self, client: TestClient) -> None:
         payload = systemone(client, request_body({})).json()

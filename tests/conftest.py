@@ -21,7 +21,8 @@ MANIFESTS_DIR = PROJECT_ROOT / "manifests"
 MODELS_DIR = PROJECT_ROOT / "models"
 FAKE_MANIFEST = MANIFESTS_DIR / "jevbert-fake-0.0.0.json"
 
-API_KEY = "test-api-key-0123456789"
+#: At least ``MIN_API_KEY_LENGTH`` characters, like every key the server accepts (S-L4).
+API_KEY = "test-api-key-0123456789-abcdefghij"
 MODEL = "jevbert-fake-0.0.0"
 
 AUTH: dict[str, str] = {
@@ -36,7 +37,9 @@ def build_settings(**overrides: Any) -> Settings:
         "manifests_dir": MANIFESTS_DIR,
         "models_dir": MODELS_DIR,
         "enable_fake_bundle": True,
-        "limits": Limits(),
+        # Matches configs/jevbert.test.yaml. The fake manifest declares 131,072
+        # request tokens and a manifest may never widen the server limits (A-F6).
+        "limits": Limits(max_request_tokens=131_072),
         "serving": ServingSettings(),
     }
     values.update(overrides)

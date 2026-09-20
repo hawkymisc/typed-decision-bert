@@ -16,7 +16,6 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from jevbert import CONFIDENCE_DEFINITION
-from jevbert.api.auth import authenticate
 from jevbert.api.encoding import json_response
 from jevbert.api.errors import (
     InferenceError,
@@ -54,7 +53,6 @@ async def system_one(request: Request) -> Response:
     engine = request.app.state.engine
     log: dict[str, Any] = request.scope["state"]["log"]
 
-    authenticate(request, settings.api_keys)
     _check_media_type(request)
     body = await _read_body(request, settings.limits.max_body_bytes)
 
@@ -124,9 +122,7 @@ async def _run_inference(
 
 @router.get("/v1/models")
 async def list_models(request: Request) -> Response:
-    settings = request.app.state.settings
     registry: ModelRegistry = request.app.state.registry
-    authenticate(request, settings.api_keys)
     return json_response({"models": registry.list_models()})
 
 
@@ -138,19 +134,17 @@ async def healthz(request: Request) -> Response:
 
 @router.get("/readyz")
 async def readyz(request: Request) -> Response:
+    """Readiness only.
+
+    Served without credentials, so the body says whether the server is ready and
+    nothing else. Which bundle is in which state is model detail and belongs to the
+    authenticated capabilities endpoint (S-L2, spec 16.1).
+    """
     registry: ModelRegistry = request.app.state.registry
     if registry.is_ready():
         return json_response({"status": "ready"})
     return json_response(
-        {
-            "status": "not_ready",
-            "bundles": [
-                {"model": bundle.public_id, "state": bundle.state.value}
-                for bundle in registry.bundles
-            ],
-        },
-        status_code=503,
-        headers={"Retry-After": "1"},
+        {"status": "not_ready"}, status_code=503, headers={"Retry-After": "1"}
     )
 
 
@@ -158,7 +152,6 @@ async def readyz(request: Request) -> Response:
 async def capabilities(request: Request) -> Response:
     settings = request.app.state.settings
     registry: ModelRegistry = request.app.state.registry
-    authenticate(request, settings.api_keys)
 
     limits = settings.limits
     payload = {

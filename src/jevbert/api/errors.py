@@ -152,14 +152,36 @@ _DEFAULT_MESSAGES: dict[int, str] = {
 }
 
 
-def error_response(request: Request, error: JevBERTError) -> Response:
-    """Render a JevBERTError as the wire body defined in spec 5.9."""
+def request_log(request: Request) -> dict[str, Any]:
+    """The per-request log record the middleware will emit, if there is one."""
+    state = request.scope.get("state") or {}
+    log = state.get("log")
+    return log if isinstance(log, dict) else {}
+
+
+def error_response(
+    request: Request, error: JevBERTError, *, headers: dict[str, str] | None = None
+) -> Response:
+    """Render a JevBERTError as the wire body defined in spec 5.9.
+
+    Also records ``error_code`` on the access log line and, for a 5xx, emits an
+    operator-facing line of its own. Without this a NaN logit or a broken invariant is
+    a silent 500: the body deliberately says nothing, so the log is the only place the
+    failure can show up (A-F1). Neither line carries request data (spec 15.2).
+    """
+    request_log(request)["error_code"] = error.code
+    if error.status_code >= 500:
+        logger.error(
+            "request failed: status=%d error_code=%s error_class=%s",
+            error.status_code,
+            error.code,
+            type(error).__name__,
+        )
+    merged = dict(error.headers())
+    if headers:
+        merged.update(headers)
     request_id = str(getattr(request.state, "request_id", ""))
-    return json_response(
-        error.body(request_id),
-        status_code=error.status_code,
-        headers=error.headers(),
-    )
+    return json_response(error.body(request_id), status_code=error.status_code, headers=merged)
 
 
 async def jevbert_error_handler(request: Request, exc: Exception) -> Response:
@@ -170,11 +192,17 @@ async def jevbert_error_handler(request: Request, exc: Exception) -> Response:
 async def http_exception_handler(request: Request, exc: Exception) -> Response:
     """Translate Starlette's own 404/405/... into the JevBERT error body."""
     assert isinstance(exc, StarletteHTTPException)
-    factory = _STATUS_TO_ERROR.get(exc.status_code, InternalError)
+    factory = _STATUS_TO_ERROR.get(exc.status_code)
+    if factory is None:
+        # A status outside the contract of spec 5.9 is a defect in this server, not a
+        # code to invent on the wire. It is reported as what it is rather than passed
+        # through with a mislabelled code (A-F12).
+        logger.error("unmapped HTTP status raised internally: status=%d", exc.status_code)
+        return error_response(request, InternalError("The request could not be processed."))
     message = _DEFAULT_MESSAGES.get(exc.status_code) or "The request could not be processed."
-    error = factory(message)
-    error.status_code = exc.status_code
-    return error_response(request, error)
+    # Starlette attaches ``Allow`` to the 405 it raises from routing; dropping it would
+    # leave the caller without the one thing a 405 is supposed to tell them (A-F12).
+    return error_response(request, factory(message), headers=dict(exc.headers or {}))
 
 
 async def request_validation_handler(request: Request, exc: Exception) -> Response:

@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from jevbert import __version__
+from jevbert.api.auth import AuthenticationMiddleware
 from jevbert.api.errors import (
     JevBERTError,
     http_exception_handler,
@@ -20,7 +21,7 @@ from jevbert.api.errors import (
 )
 from jevbert.api.middleware import RequestContextMiddleware
 from jevbert.api.routes import router
-from jevbert.config import Settings
+from jevbert.config import Settings, validate_api_keys
 from jevbert.inference.engine import InferenceEngine
 from jevbert.inference.registry import ModelRegistry
 
@@ -40,8 +41,7 @@ def create_app(
     finished rather than blocking startup (spec 16.1). ``load_on_startup=False`` lets a
     test drive readiness itself.
     """
-    if not settings.api_keys:
-        raise ValueError("create_app requires at least one API key; there is no open mode")
+    validate_api_keys(settings.api_keys)
 
     engine = engine or InferenceEngine(
         max_pending_requests=settings.serving.max_pending_requests,
@@ -85,5 +85,9 @@ def create_app(
     app.add_exception_handler(RequestValidationError, request_validation_handler)
 
     app.include_router(router)
+    # Added inner first: Starlette wraps the most recently added middleware outermost,
+    # so the request context (ID, headers, log line) surrounds authentication, and
+    # authentication surrounds routing (S-M3).
+    app.add_middleware(AuthenticationMiddleware, api_keys=settings.api_keys)
     app.add_middleware(RequestContextMiddleware, contract_profile=settings.contract_profile)
     return app

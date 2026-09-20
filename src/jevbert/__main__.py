@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -70,14 +71,24 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _init_env(path: Path) -> int:
-    if path.exists():
-        print(
-            f"jevbert: {path} already exists; it was left unchanged.",
-            file=sys.stderr,
-        )
-        return 1
+    """Write a new key, or refuse if the file is already there.
+
+    Created with ``O_EXCL`` rather than an ``exists()`` check followed by a write: the
+    check and the write are not one step, and losing that race would overwrite the
+    operator's own credential. The mode is set at creation time so the secret is never
+    briefly world readable (S-L5).
+    """
     key = secrets.token_urlsafe(32)
-    path.write_text(_ENV_TEMPLATE.format(env=API_KEYS_ENV, key=key), encoding="utf-8")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        print(f"jevbert: {path} already exists; it was left unchanged.", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"jevbert: cannot create {path}: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(_ENV_TEMPLATE.format(env=API_KEYS_ENV, key=key))
     print(f"jevbert: wrote a new API key to {path}. Keep it secret and out of git.")
     return 0
 

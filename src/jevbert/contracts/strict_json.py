@@ -55,13 +55,21 @@ def parse_strict_json(body: bytes, *, max_depth: int = 32) -> Any:
             parse_float=_parse_float,
         )
     except _DuplicateKeyError as exc:
-        raise InvalidJSONError(f"Duplicate JSON object key: {exc.key!r}.") from exc
+        # The key is not quoted back: the error body is readable by whoever sent the
+        # request, and a duplicated key name is the caller's own data (S-L1).
+        raise InvalidJSONError("The request body contains a duplicate object key.") from exc
     except _NonFiniteNumberError as exc:
         raise InvalidJSONError("JSON numbers must be finite.") from exc
     except json.JSONDecodeError as exc:
         raise InvalidJSONError("The request body is not valid JSON.") from exc
     except RecursionError as exc:
         raise InvalidJSONError("The request body is nested too deeply.") from exc
+    except ValueError as exc:
+        # CPython refuses ``int()`` on literals longer than ``sys.int_info`` allows
+        # (4300 digits by default) with a plain ValueError, which would otherwise make
+        # a caller-controlled literal a 500 (S-M1). Any other ValueError from the
+        # decoder is likewise a malformed body, not a server fault.
+        raise InvalidJSONError("The request body is not valid JSON.") from exc
 
     _reject_lone_surrogates(value)
     return value

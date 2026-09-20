@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 import pytest
-from hypothesis import assume, given
+from hypothesis import assume, example, given
 from hypothesis import strategies as st
 
 from jevbert.compiler.normalize import canonical_json, render
@@ -55,6 +55,7 @@ class TestPT01Distributions:
         assert 0.0 <= confidence <= 1.0
 
     @given(LOGITS)
+    @example([0.0, 1e-6])
     def test_confidence_is_zero_exactly_when_the_distribution_is_flat(
         self, logits: list[float]
     ) -> None:
@@ -62,15 +63,29 @@ class TestPT01Distributions:
         # at all" and nothing else. The old assertion here only fired when confidence
         # exceeded 0.5, which every non-degenerate distribution satisfies anyway.
         #
-        # Both directions need a tolerance: a uniform vector of 24 entries sums its
-        # entropy to within one ulp of log K, which lands a hair either side of zero.
+        # Both directions need a tolerance. A perfectly uniform vector sums its entropy
+        # to within an ulp of log K, landing a hair either side of zero. And the
+        # statistic is quadratic near the uniform point - its gradient there is zero -
+        # so a confidence at 1e-12 still admits a spread around 1e-6. The bound below
+        # is that relation with room to spare; it still rules out anything a reader
+        # would call concentrated.
         p = probabilities_from_logits(logits)
         confidence = normalized_entropy_confidence(p)
         spread = max(p) - min(p)
         if spread == 0.0:
             assert confidence <= FLAT_CONFIDENCE
         if confidence <= FLAT_CONFIDENCE:
-            assert spread <= 1e-9
+            assert spread <= 1e-4
+
+    @given(LOGITS)
+    def test_a_visibly_concentrated_distribution_has_a_visible_confidence(
+        self, logits: list[float]
+    ) -> None:
+        # The other half of the same statement, stated where the quadratic does not
+        # bite: a distribution that is plainly not flat reports so.
+        p = probabilities_from_logits(logits)
+        if max(p) - min(p) >= 0.01:
+            assert normalized_entropy_confidence(p) > 1e-6
 
     @given(st.integers(min_value=2, max_value=64), st.floats(min_value=-20, max_value=20))
     def test_equal_logits_give_a_confidence_of_zero(self, count: int, logit: float) -> None:

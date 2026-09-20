@@ -87,7 +87,6 @@ async def system_one(request: Request) -> Response:
         grouped_logits=split_by_question(encoded, logits),
         temperatures=bundle.temperatures,
     )
-    _set_usage_header(request, encoded.total_tokens)
     return json_response(payload)
 
 
@@ -110,8 +109,6 @@ async def _run_inference(
         logits = await engine.run(work, deadline=deadline)
     except InferenceCancelled as exc:
         raise ModelUnavailableError("The inference job was cancelled.") from exc
-    except InferenceError:
-        raise
     except (ValueError, RuntimeError, MemoryError, OSError) as exc:
         # Includes CUDA OOM once the real backend is in place (POC_DESIGN 6.3).
         logger.error("backend %s failed: %s", bundle.manifest.backend, exc, exc_info=exc)
@@ -271,10 +268,6 @@ def _set_bundle_headers(request: Request, bundle: Bundle) -> None:
     headers["X-JevBERT-Usage"] = bundle.manifest.usage_semantics
     headers["X-JevBERT-Calibration"] = bundle.manifest.calibration.state
     headers["X-JevBERT-Confidence"] = bundle.manifest.confidence or CONFIDENCE_DEFINITION
-
-
-def _set_usage_header(request: Request, input_tokens: int) -> None:
-    request.scope["state"]["log"]["input_tokens"] = input_tokens
 
 
 def _question_type_counts(validated: Any) -> dict[str, int]:

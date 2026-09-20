@@ -12,7 +12,7 @@ import hashlib
 import time
 from collections.abc import Callable, Sequence
 
-from jevbert.backends.base import CancelToken, EncodedSequence, TextPair
+from jevbert.backends.base import WARMUP_PREMISE, CancelToken, EncodedSequence, TextPair
 
 #: Separator between premise and hypothesis, so that ("ab", "") and ("a", "b") differ.
 _SEPARATOR = b"\x1f"
@@ -21,6 +21,11 @@ _LOGIT_RANGE = 4.0
 
 #: Stand-in for a tokenizer: UTF-8 byte length plus the four special tokens.
 _SPECIAL_TOKEN_COUNT = 4
+
+
+def utf8_length(text: str) -> int:
+    """This backend's stand-in for tokenizing one side of a pair."""
+    return len(text.encode("utf-8"))
 
 LogitFn = Callable[[Sequence[TextPair]], Sequence[float]]
 
@@ -53,29 +58,45 @@ class FakeBackend:
         self.loaded = True
 
     def count_and_encode(self, pairs: Sequence[TextPair]) -> list[EncodedSequence]:
-        return [
-            EncodedSequence(
-                token_count=(
-                    len(pair.premise.encode("utf-8"))
-                    + len(pair.hypothesis.encode("utf-8"))
-                    + _SPECIAL_TOKEN_COUNT
-                ),
-                data=pair,
+        """Measure each pair, paying for a repeated premise only once (S-H2).
+
+        The map lives for the length of this call only, as ``backends/base.py``
+        requires.
+        """
+        premise_lengths: dict[str, int] = {}
+        sequences: list[EncodedSequence] = []
+        for pair in pairs:
+            premise_length = premise_lengths.get(pair.premise)
+            if premise_length is None:
+                premise_length = utf8_length(pair.premise)
+                premise_lengths[pair.premise] = premise_length
+            sequences.append(
+                EncodedSequence(
+                    token_count=(
+                        premise_length + utf8_length(pair.hypothesis) + _SPECIAL_TOKEN_COUNT
+                    ),
+                    data=pair,
+                )
             )
-            for pair in pairs
-        ]
+        return sequences
 
     def score(self, sequences: Sequence[EncodedSequence], cancel: CancelToken) -> list[float]:
         cancel.raise_if_cancelled()
         pairs = [sequence.data for sequence in sequences]
-        self._sleep(cancel)
+        self._sleep(cancel, pairs)
         if self._logit_fn is not None:
             return list(self._logit_fn(pairs))
         return [_hash_logit(pair) for pair in pairs]
 
-    def _sleep(self, cancel: CancelToken) -> None:
-        """Simulate a slow model, staying responsive to cancellation (CT10)."""
+    def _sleep(self, cancel: CancelToken, pairs: Sequence[TextPair]) -> None:
+        """Simulate a slow model, staying responsive to cancellation (CT10).
+
+        The warmup fixture is exempt: a slow fake is how 529 and 504 are reproduced,
+        and charging that delay to every bundle load would only slow the suite down.
+        """
         remaining = self._delay_seconds
+        if all(pair.premise == WARMUP_PREMISE for pair in pairs):
+            remaining = 0.0
         while remaining > 0.0:
             cancel.raise_if_cancelled()
             step = min(0.01, remaining)

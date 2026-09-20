@@ -11,15 +11,23 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jevbert.api.errors import ModelNotFoundError
-from jevbert.backends.base import Backend, CancelToken, TextPair
+from jevbert.backends.base import (
+    WARMUP_PREMISE,
+    Backend,
+    CancelToken,
+    EncodedSequence,
+    TextPair,
+)
 from jevbert.backends.fake import FakeBackend
 from jevbert.compiler.compiled import TokenBudget
 from jevbert.compiler.normalize import canonical_json
@@ -32,8 +40,8 @@ FAKE_MANIFEST_FILENAME = "jevbert-fake-0.0.0.json"
 
 #: Fixed warmup input: a minimum fixture, not a user request (spec 16.1).
 _WARMUP_PAIRS = (
-    TextPair(premise="warmup", hypothesis="The answer to the question is no."),
-    TextPair(premise="warmup", hypothesis="The answer to the question is yes."),
+    TextPair(premise=WARMUP_PREMISE, hypothesis="The answer to the question is no."),
+    TextPair(premise=WARMUP_PREMISE, hypothesis="The answer to the question is yes."),
 )
 
 
@@ -79,6 +87,10 @@ class BundleManifest(_Strict):
     usage_semantics: str
     dtype: str
     limits: BundleLimits
+    #: Longest sequence the backbone can encode at all. ``limits.max_sequence_tokens``
+    #: above it refuses startup rather than failing per request (POC_DESIGN 5.5).
+    #: ``None`` where there is no model, as in the fake bundle.
+    model_max_sequence_tokens: int | None = Field(default=None, gt=0)
     validated: Validated = Field(default_factory=Validated)
 
 
@@ -86,6 +98,15 @@ class BundleState(Enum):
     LOADING = "loading"
     READY = "ready"
     FAILED = "failed"
+
+
+@runtime_checkable
+class WarmupRunner(Protocol):
+    """The part of ``InferenceEngine`` a bundle needs in order to warm up (A-F10)."""
+
+    def run_blocking(self, work: Callable[[CancelToken], Any]) -> Any: ...
+
+    def run_encoding_blocking(self, work: Callable[[CancelToken], Any]) -> Any: ...
 
 
 def bundle_digest(raw_manifest: Mapping[str, Any]) -> str:
@@ -123,30 +144,51 @@ class Bundle:
     def temperatures(self) -> dict[str, float]:
         return dict(self.manifest.calibration.temperature)
 
-    def load(self) -> None:
-        """Load, then warm up on a fixed fixture. Failure marks the bundle, not the process."""
+    def load(self, runner: WarmupRunner | None = None) -> None:
+        """Load, then warm up on a fixed fixture.
+
+        Failure marks the bundle, not the process (spec 16.1). ``runner`` is the
+        inference engine: when it is given, warmup runs on the very threads that serve
+        requests, so a warmup forward pass can never touch the device beside a served
+        one (A-F10). Without it the calls are direct, which is what a unit test that
+        has no engine wants.
+        """
         try:
             self.backend.load()
-            self._warmup()
+            self._warmup(runner)
         except Exception as exc:
             self.state = BundleState.FAILED
-            self.error = f"{type(exc).__name__}: {exc}"
+            self.error = type(exc).__name__
             # Readiness failure must not be mistaken for liveness failure (spec 16.1).
+            # The exception message is not logged: a backend failure can quote the
+            # model path or the input it choked on (spec 15.2).
             logger.error(
-                "bundle %s failed to load: %s", self.public_id, self.error, exc_info=exc
+                "bundle %s failed to load: error_class=%s", self.public_id, self.error
             )
             return
         self.state = BundleState.READY
         logger.info("bundle %s is ready (%s)", self.public_id, self.digest)
 
-    def _warmup(self) -> None:
-        sequences = self.backend.count_and_encode(_WARMUP_PAIRS)
+    def _warmup(self, runner: WarmupRunner | None) -> None:
+        backend = self.backend
+
+        def encode(cancel: CancelToken) -> list[EncodedSequence]:
+            return backend.count_and_encode(_WARMUP_PAIRS)
+
+        def score(cancel: CancelToken) -> list[float]:
+            return backend.score(sequences, cancel)
+
+        if runner is None:
+            sequences = encode(CancelToken())
+        else:
+            sequences = runner.run_encoding_blocking(encode)
         if len(sequences) != len(_WARMUP_PAIRS):
             raise RuntimeError("warmup encoding returned the wrong number of sequences")
-        logits = self.backend.score(sequences, CancelToken())
+
+        logits = score(CancelToken()) if runner is None else runner.run_blocking(score)
         if len(logits) != len(_WARMUP_PAIRS):
             raise RuntimeError("warmup scoring returned the wrong number of logits")
-        if not all(isinstance(z, float) and z == z and abs(z) != float("inf") for z in logits):
+        if not all(isinstance(z, float) and math.isfinite(z) for z in logits):
             raise RuntimeError("warmup scoring returned a non-finite logit")
 
 
@@ -215,15 +257,45 @@ class ModelRegistry:
             )
         return models
 
-    def load_all(self) -> None:
+    def load_all(self, runner: WarmupRunner | None = None) -> None:
         for bundle in self._bundles:
-            bundle.load()
+            bundle.load(runner)
 
 
-BackendFactory = Callable[[BundleManifest, Path], Backend]
+@dataclass(frozen=True)
+class BackendContext:
+    """Everything a backend needs from the server configuration (A-F5).
+
+    Passing the whole context rather than a directory is what lets phase 2 add
+    ``backends/nli.py`` plus one entry in ``_BACKEND_FACTORIES`` and change nothing
+    else: the microbatch ceilings of POC_DESIGN 6.3 and the device choice arrive here
+    instead of being settings that nothing reads.
+    """
+
+    models_dir: Path
+    max_batch_tokens: int
+    max_batch_sequences: int
+    device: str
 
 
-def _build_fake(manifest: BundleManifest, models_dir: Path) -> Backend:
+BackendFactory = Callable[[BundleManifest, BackendContext], Backend]
+
+
+def backend_context(settings: Settings) -> BackendContext:
+    return BackendContext(
+        models_dir=settings.models_dir,
+        max_batch_tokens=settings.serving.max_batch_tokens,
+        max_batch_sequences=settings.serving.max_batch_sequences,
+        device=settings.serving.device,
+    )
+
+
+def _build_fake(manifest: BundleManifest, context: BackendContext) -> Backend:
+    """The fake backend has no weights, no device and no batching to configure.
+
+    Nothing from the manifest or the configuration selects ``logit_fn`` or a delay:
+    those are constructor arguments of the test double alone (POC_DESIGN 6.2).
+    """
     return FakeBackend()
 
 
@@ -240,14 +312,14 @@ def register_backend_factory(backend_id: str, factory: BackendFactory) -> None:
     _BACKEND_FACTORIES[backend_id] = factory
 
 
-def build_backend(manifest: BundleManifest, models_dir: Path) -> Backend:
+def build_backend(manifest: BundleManifest, context: BackendContext) -> Backend:
     factory = _BACKEND_FACTORIES.get(manifest.backend)
     if factory is None:
         raise ConfigurationError(
             f"Manifest {manifest.public_id} requests unknown backend {manifest.backend!r}. "
             f"Known backends: {', '.join(sorted(_BACKEND_FACTORIES))}"
         )
-    return factory(manifest, models_dir)
+    return factory(manifest, context)
 
 
 def read_manifest(path: Path) -> tuple[BundleManifest, str]:
@@ -275,6 +347,7 @@ def build_registry(settings: Settings) -> ModelRegistry:
     if settings.enable_fake_bundle and FAKE_MANIFEST_FILENAME not in filenames:
         filenames.append(FAKE_MANIFEST_FILENAME)
 
+    context = backend_context(settings)
     bundles: list[Bundle] = []
     for filename in filenames:
         manifest, digest = read_manifest(settings.manifests_dir / filename)
@@ -284,7 +357,7 @@ def build_registry(settings: Settings) -> ModelRegistry:
                 "The fake backend never registers implicitly."
             )
         _check_manifest_against_limits(manifest, settings)
-        backend = build_backend(manifest, settings.models_dir)
+        backend = build_backend(manifest, context)
         bundles.append(Bundle(manifest, digest, backend))
 
     if not bundles:
@@ -293,9 +366,31 @@ def build_registry(settings: Settings) -> ModelRegistry:
 
 
 def _check_manifest_against_limits(manifest: BundleManifest, settings: Settings) -> None:
+    """A manifest may narrow the configured limits; it may never widen them (A-F6).
+
+    The bundle's limits are what the request path actually enforces, so a manifest
+    declaring more than the server was configured for would quietly raise the ceiling
+    the operator set, and one declaring more than the backbone can encode would turn
+    into a failure on every long request instead of a refusal to start.
+    """
     if manifest.limits.max_sequence_tokens > manifest.limits.max_request_tokens:
         raise ConfigurationError(
             f"{manifest.public_id}: max_sequence_tokens exceeds max_request_tokens"
+        )
+    for name in ("max_sequence_tokens", "max_request_tokens"):
+        declared = getattr(manifest.limits, name)
+        configured = getattr(settings.limits, name)
+        if declared > configured:
+            raise ConfigurationError(
+                f"{manifest.public_id}: the manifest declares {name}={declared} but the "
+                f"server is configured for {configured}. A manifest cannot widen a limit."
+            )
+    model_limit = manifest.model_max_sequence_tokens
+    if model_limit is not None and manifest.limits.max_sequence_tokens > model_limit:
+        raise ConfigurationError(
+            f"{manifest.public_id}: max_sequence_tokens="
+            f"{manifest.limits.max_sequence_tokens} exceeds "
+            f"model_max_sequence_tokens={model_limit}."
         )
     if manifest.confidence != "normalized-entropy-v1":
         raise ConfigurationError(

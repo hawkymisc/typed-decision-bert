@@ -11,15 +11,20 @@ import pytest
 from jevbert.api.errors import ModelNotFoundError
 from jevbert.backends.base import Backend, CancelToken, EncodedSequence, TextPair
 from jevbert.backends.fake import FakeBackend
-from jevbert.config import ConfigurationError, ServingSettings
+from jevbert.config import ConfigurationError, Limits, ServingSettings
 from jevbert.inference.registry import (
+    _BACKEND_FACTORIES,
+    BackendContext,
     Bundle,
+    BundleManifest,
     BundleState,
     ModelRegistry,
+    backend_context,
     build_backend,
     build_registry,
     bundle_digest,
     read_manifest,
+    register_backend_factory,
 )
 from tests.conftest import FAKE_MANIFEST, MODEL, build_settings
 
@@ -99,15 +104,138 @@ class TestReadManifest:
 
 
 class TestBackendFactory:
+    """A-F5: a factory receives everything a real backend needs to configure itself."""
+
     def test_known_backend_is_built(self, tmp_path: Path) -> None:
         manifest, _ = read_manifest(FAKE_MANIFEST)
-        assert isinstance(build_backend(manifest, tmp_path), FakeBackend)
+        assert isinstance(build_backend(manifest, _context(tmp_path)), FakeBackend)
 
     def test_unknown_backend_names_the_known_ones(self, tmp_path: Path) -> None:
         path = write_manifest(tmp_path, "unknown.json", backend="a0-nli-zeroshot-v1")
         manifest, _ = read_manifest(path)
         with pytest.raises(ConfigurationError, match="a0-nli-zeroshot-v1"):
-            build_backend(manifest, tmp_path)
+            build_backend(manifest, _context(tmp_path))
+
+    def test_the_context_carries_the_serving_batch_settings(self) -> None:
+        # Before phase 1.5 these three were configurable and read by nobody, which is
+        # the kind of setting that looks like it does something and does not.
+        settings = build_settings(
+            serving=ServingSettings(
+                max_batch_tokens=1234, max_batch_sequences=7, device="cpu"
+            )
+        )
+        context = backend_context(settings)
+        assert context.max_batch_tokens == 1234
+        assert context.max_batch_sequences == 7
+        assert context.device == "cpu"
+        assert context.models_dir == settings.models_dir
+
+    def test_the_context_defaults_match_the_configuration_files(self) -> None:
+        context = backend_context(build_settings())
+        assert (context.max_batch_tokens, context.max_batch_sequences) == (16_384, 64)
+        assert context.device == "auto"
+
+    def test_a_registered_factory_receives_the_context(self) -> None:
+        seen: list[BackendContext] = []
+
+        def factory(manifest: BundleManifest, context: BackendContext) -> FakeBackend:
+            seen.append(context)
+            return FakeBackend()
+
+        backend_id = "test-only-context-probe-v1"
+        register_backend_factory(backend_id, factory)
+        try:
+            manifest, _ = read_manifest(FAKE_MANIFEST)
+            probe = manifest.model_copy(update={"backend": backend_id})
+            context = backend_context(build_settings())
+            assert isinstance(build_backend(probe, context), FakeBackend)
+            assert seen == [context]
+        finally:
+            _BACKEND_FACTORIES.pop(backend_id, None)
+
+    def test_a_backend_id_cannot_be_registered_twice(self) -> None:
+        def factory(manifest: BundleManifest, context: BackendContext) -> FakeBackend:
+            return FakeBackend()
+
+        with pytest.raises(ConfigurationError, match="already registered"):
+            register_backend_factory(FakeBackend.backend_id, factory)
+
+
+def _context(models_dir: Path) -> BackendContext:
+    return BackendContext(
+        models_dir=models_dir, max_batch_tokens=16_384, max_batch_sequences=64, device="auto"
+    )
+
+
+class TestManifestLimitsNeverWidenTheServer:
+    """A-F6: a manifest may narrow the configured limits, never widen them."""
+
+    def _settings(self, tmp_path: Path, **limit_overrides: int) -> Any:
+        return build_settings(
+            manifests_dir=tmp_path,
+            enable_fake_bundle=True,
+            limits=Limits(max_sequence_tokens=2048, max_request_tokens=131_072, **limit_overrides),
+        )
+
+    def test_a_manifest_sequence_limit_above_the_server_limit_refuses_startup(
+        self, tmp_path: Path
+    ) -> None:
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            limits={"max_sequence_tokens": 4096, "max_request_tokens": 131_072},
+        )
+        with pytest.raises(ConfigurationError, match="max_sequence_tokens"):
+            build_registry(self._settings(tmp_path))
+
+    def test_a_manifest_request_limit_above_the_server_limit_refuses_startup(
+        self, tmp_path: Path
+    ) -> None:
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            limits={"max_sequence_tokens": 2048, "max_request_tokens": 262_144},
+        )
+        with pytest.raises(ConfigurationError, match="max_request_tokens"):
+            build_registry(self._settings(tmp_path))
+
+    def test_a_narrower_manifest_is_accepted(self, tmp_path: Path) -> None:
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            limits={"max_sequence_tokens": 512, "max_request_tokens": 1024},
+        )
+        registry = build_registry(self._settings(tmp_path))
+        budget = registry.bundles[0].token_budget
+        assert (budget.max_sequence_tokens, budget.max_request_tokens) == (512, 1024)
+
+    def test_a_sequence_limit_above_the_model_limit_refuses_startup(
+        self, tmp_path: Path
+    ) -> None:
+        # POC_DESIGN 5.5: a configuration above what the backbone can encode must not
+        # start, because the overflow would surface as a runtime failure per request.
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            model_max_sequence_tokens=1024,
+            limits={"max_sequence_tokens": 2048, "max_request_tokens": 131_072},
+        )
+        with pytest.raises(ConfigurationError, match="model_max_sequence_tokens"):
+            build_registry(self._settings(tmp_path))
+
+    def test_a_sequence_limit_at_the_model_limit_is_accepted(self, tmp_path: Path) -> None:
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            model_max_sequence_tokens=2048,
+            limits={"max_sequence_tokens": 2048, "max_request_tokens": 131_072},
+        )
+        registry = build_registry(self._settings(tmp_path))
+        assert registry.bundles[0].manifest.model_max_sequence_tokens == 2048
+
+    def test_the_model_limit_is_optional(self) -> None:
+        manifest, _ = read_manifest(FAKE_MANIFEST)
+        assert manifest.model_max_sequence_tokens is None
 
 
 class TestModelRegistry:
@@ -168,7 +296,10 @@ class TestWarmup:
         bundle = Bundle(manifest, digest, Failing())
         bundle.load()
         assert bundle.state is BundleState.FAILED
-        assert "no weights" in (bundle.error or "")
+        # The class name, not the message: a real backend quotes the model path or the
+        # input it choked on, and this string is one step from a log line (S-M2).
+        assert bundle.error == "RuntimeError"
+        assert "no weights" not in (bundle.error or "")
 
     def test_a_backend_returning_a_non_finite_warmup_logit_is_marked_failed(self) -> None:
         class NotFinite(FakeBackend):

@@ -18,6 +18,7 @@ from starlette.responses import Response
 from jevbert import CONFIDENCE_DEFINITION
 from jevbert.api.encoding import json_response
 from jevbert.api.errors import (
+    DeadlineExceededError,
     InferenceError,
     ModelUnavailableError,
     RequestTooLargeError,
@@ -29,13 +30,13 @@ from jevbert.compiler.serializer_nli import (
     NLI_TEMPLATE_ID,
     SERIALIZER_VERSION,
     all_sequences,
-    compile_request,
-    encode_request,
+    compile_and_encode,
     split_by_question,
 )
+from jevbert.config import Limits
 from jevbert.contracts.response import build_response
 from jevbert.contracts.strict_json import parse_strict_json
-from jevbert.contracts.validator import validate_request
+from jevbert.contracts.validator import ValidatedRequest, validate_request
 from jevbert.inference.registry import Bundle, ModelRegistry
 
 logger = logging.getLogger("jevbert.api")
@@ -70,14 +71,9 @@ async def system_one(request: Request) -> Response:
             "The model bundle is not ready to serve requests yet."
         )
 
-    compile_started = time.monotonic()
-    compiled = compile_request(validated)
-    encoded = encode_request(compiled, bundle.backend, bundle.token_budget)
-    log["compile_ms"] = round((time.monotonic() - compile_started) * 1000, 3)
-    log["sequences"] = sum(len(q.sequences) for q in encoded.questions)
-    log["input_tokens"] = encoded.total_tokens
-
-    logits = await _run_inference(request, engine, bundle, encoded, log)
+    deadline = engine.deadline_from(request.scope["state"]["started_at"])
+    encoded = await _run_encoding(engine, bundle, validated, settings.limits, deadline, log)
+    logits = await _run_inference(engine, bundle, encoded, deadline, log)
 
     payload = build_response(
         model_id=bundle.public_id,
@@ -88,28 +84,66 @@ async def system_one(request: Request) -> Response:
     return json_response(payload)
 
 
+async def _run_encoding(
+    engine: Any,
+    bundle: Bundle,
+    validated: ValidatedRequest,
+    limits: Limits,
+    deadline: float,
+    log: dict[str, Any],
+) -> EncodedRequest:
+    """Compile and tokenize on the encoder thread (S-H2).
+
+    Held under the same deadline and the same admission counter as inference, so a
+    tokenizer that takes minutes on a hostile input ends as a 504 instead of stalling
+    the event loop for every other caller.
+    """
+    max_request_chars = limits.effective_max_request_chars
+
+    def work(cancel: CancelToken) -> EncodedRequest:
+        return compile_and_encode(
+            validated, bundle.backend, bundle.token_budget, max_request_chars=max_request_chars
+        )
+
+    compile_started = time.monotonic()
+    try:
+        encoded = await engine.run_encoding(work, deadline=deadline)
+    except InferenceCancelled as exc:
+        raise DeadlineExceededError("The request deadline passed during encoding.") from exc
+    except (ValueError, RuntimeError, MemoryError, OSError) as exc:
+        _log_backend_failure("encode", bundle, type(exc).__name__, sequences=None, tokens=None)
+        raise InferenceError("The model failed to encode the request.") from exc
+    log["compile_ms"] = round((time.monotonic() - compile_started) * 1000, 3)
+    log["sequences"] = sum(len(q.sequences) for q in encoded.questions)
+    log["input_tokens"] = encoded.total_tokens
+    return encoded
+
+
 async def _run_inference(
-    request: Request,
     engine: Any,
     bundle: Bundle,
     encoded: EncodedRequest,
+    deadline: float,
     log: dict[str, Any],
 ) -> list[float]:
-    sequences: list[EncodedSequence] = all_sequences(encoded)  # type: ignore[assignment]
+    sequences: list[EncodedSequence] = all_sequences(encoded)
     expected = len(sequences)
 
     def work(cancel: CancelToken) -> list[float]:
         return bundle.backend.score(sequences, cancel)
 
     queued_at = time.monotonic()
-    deadline = engine.deadline_from(request.scope["state"]["started_at"])
     try:
         logits = await engine.run(work, deadline=deadline)
     except InferenceCancelled as exc:
-        raise ModelUnavailableError("The inference job was cancelled.") from exc
+        # The only thing that cancels a job is the deadline or a dropped connection,
+        # and the contract for that is 504, not 503 (A-F9, spec 5.9).
+        raise DeadlineExceededError("The request deadline passed during inference.") from exc
     except (ValueError, RuntimeError, MemoryError, OSError) as exc:
         # Includes CUDA OOM once the real backend is in place (POC_DESIGN 6.3).
-        logger.error("backend %s failed: %s", bundle.manifest.backend, exc, exc_info=exc)
+        _log_backend_failure(
+            "score", bundle, type(exc).__name__, sequences=expected, tokens=encoded.total_tokens
+        )
         raise InferenceError("The model failed to score the request.") from exc
     log["inference_ms"] = round((time.monotonic() - queued_at) * 1000, 3)
 
@@ -118,6 +152,27 @@ async def _run_inference(
             f"The backend returned {len(logits)} logits for {expected} candidates."
         )
     return logits
+
+
+def _log_backend_failure(
+    stage: str, bundle: Bundle, error_class: str, *, sequences: int | None, tokens: int | None
+) -> None:
+    """Report a backend failure with context but without the exception message.
+
+    A real tokenizer or torch error quotes the offending input, and a traceback ends
+    with that same message, so neither the message nor ``exc_info`` may be logged
+    (S-M2, spec 15.2). What an operator needs - which stage, which backend, which
+    bundle and how much work was in flight - carries no request data.
+    """
+    logger.error(
+        "backend failure: stage=%s backend=%s bundle=%s error_class=%s sequences=%s tokens=%s",
+        stage,
+        bundle.manifest.backend,
+        bundle.digest,
+        error_class,
+        "unknown" if sequences is None else sequences,
+        "unknown" if tokens is None else tokens,
+    )
 
 
 @router.get("/v1/models")
@@ -167,6 +222,7 @@ async def capabilities(request: Request) -> Response:
             "max_choice_options": limits.max_choice_options,
             "min_score_levels": limits.min_score_levels,
             "max_score_levels": limits.max_score_levels,
+            "max_request_chars": limits.effective_max_request_chars,
             "overflow_policy": limits.overflow_policy,
             "request_deadline_seconds": settings.serving.request_deadline_seconds,
             "max_pending_requests": settings.serving.max_pending_requests,

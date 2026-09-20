@@ -13,6 +13,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+#: Premise of the fixed warmup fixture (spec 16.1). It is not user data, so a backend
+#: is free to recognise it - the fake one skips its simulated latency for it.
+WARMUP_PREMISE = "warmup"
+
 
 class InferenceCancelled(Exception):
     """Raised inside a backend when the request was cancelled or timed out."""
@@ -75,6 +79,17 @@ class Backend(Protocol):
 
         Never truncates: the caller enforces the token budget and rejects overflow
         (spec 6.3).
+
+        An A0 backend receives one pair per candidate, and every pair of one request
+        carries the *same* premise: up to 32 questions x 255 options is 8,160 copies of
+        the state. An implementation SHOULD therefore tokenize each distinct premise
+        once per call and reuse the result, rather than paying for the state once per
+        candidate (S-H2). Any cache is per call: a map keyed by user text that outlives
+        the call would be a second place request data lives (spec 15.2, 12.4).
+
+        Called on the engine's single encoder thread, so an implementation does not
+        have to make a tokenizer safe for concurrent use, and must not assume it runs
+        on the event loop.
         """
 
     def score(self, sequences: Sequence[EncodedSequence], cancel: CancelToken) -> list[float]:

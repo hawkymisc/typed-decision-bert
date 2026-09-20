@@ -53,8 +53,10 @@ def create_app(
         engine.start()
         loader: threading.Thread | None = None
         if load_on_startup:
+            # Warmup goes through the engine's workers, not straight at the backend,
+            # so it cannot touch the device beside a served request (A-F10).
             loader = threading.Thread(
-                target=registry.load_all, name="jevbert-loader", daemon=True
+                target=registry.load_all, args=(engine,), name="jevbert-loader", daemon=True
             )
             loader.start()
         try:

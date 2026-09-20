@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:jevbert:request:jevbert-core-2026-09-21",
+  "title": "JevBERT SystemOne Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "model",
+    "state",
+    "questions"
+  ],
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "$ref": "#/$defs/Content"
+    },
+    "questions": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 32,
+      "additionalProperties": {
+        "$ref": "#/$defs/Question"
+      }
+    }
+  },
+  "$defs": {
+    "JSONValue": {
+      "anyOf": [
+        {
+          "type": [
+            "null",
+            "boolean",
+            "number",
+            "string"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JSONValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JSONValue"
+          }
+        }
+      ]
+    },
+    "Content": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JSONValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JSONValue"
+          }
+        }
+      ]
+    },
+    "Entry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Content"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "Noul": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "noul"
+        },
+        "instructions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "criteria": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "true": {
+                  "$ref": "#/$defs/Entry"
+                },
+                "false": {
+                  "$ref": "#/$defs/Entry"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "Choice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "criteria"
+      ],
+      "properties": {
+        "type": {
+          "const": "choice"
+        },
+        "instructions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "criteria": {
+          "type": "object",
+          "minProperties": 2,
+          "maxProperties": 255,
+          "additionalProperties": {
+            "$ref": "#/$defs/Entry"
+          }
+        }
+      }
+    },
+    "Score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "criteria"
+      ],
+      "properties": {
+        "type": {
+          "const": "score"
+        },
+        "instructions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "criteria": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/Content"
+          }
+        }
+      }
+    },
+    "Question": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Noul"
+        },
+        {
+          "$ref": "#/$defs/Choice"
+        },
+        {
+          "$ref": "#/$defs/Score"
+        }
+      ]
+    }
+  }
+}

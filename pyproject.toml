@@ -1,0 +1,66 @@
+[project]
+name = "jevbert"
+version = "0.1.0"
+description = "JevBERT - Jev-compatible typed decision API server (P0.5 PoC)"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "torch>=2.7",
+    "transformers>=4.48",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.27",
+]
+
+[project.scripts]
+jevbert = "jevbert.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.112",
+    "jsonschema>=4.23",
+    "httpx>=0.27",
+    "typesafe-sdk==0.7.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jevbert"]
+
+# RTX 5090 (Blackwell, sm_120) needs a PyTorch built against CUDA 12.8 or newer.
+# The wheels only live on the PyTorch index, so it is declared explicit and bound
+# to `torch` alone (POC_DESIGN 2).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "PLC0415"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "model: requires the real model bundle (weights fetched via `python -m jevbert fetch-model`)",
+]
+filterwarnings = ["error::DeprecationWarning:jevbert.*"]

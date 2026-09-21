@@ -22,3 +22,6 @@ models/
 # logs
 *.log
 logs/
+
+# benchmark data, samples and results (`python -m bench`, docs/BENCHMARK.md)
+bench_runs/

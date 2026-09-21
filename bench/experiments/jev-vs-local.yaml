@@ -1,0 +1,136 @@
+# Real Jev vs. the local Jev-compatible API, on three public classification datasets.
+# Design, and what is NOT apple-to-apple about it: docs/BENCHMARK.md
+#
+#   uv run python -m bench prepare bench/experiments/jev-vs-local.yaml
+#   uv run python -m bench plan    bench/experiments/jev-vs-local.yaml
+#   uv run python -m bench run     bench/experiments/jev-vs-local.yaml --target local
+#   uv run python -m bench run     bench/experiments/jev-vs-local.yaml --target jev --allow-billable
+#   uv run python -m bench report  bench/experiments/jev-vs-local.yaml
+#
+# Relative paths are relative to this file.
+
+name: jev-vs-local
+output_dir: ../../bench_runs/jev-vs-local
+# Drives the stratified draw and the bootstrap. Change it to draw a different sample.
+seed: 20260922
+
+# --- Shared by every target (BENCHMARK 4). A target cannot override these. ---
+model: jev-latest          # the SDK's default; the answered model is recorded per sample
+question_id: label
+
+client:                    # the official SDK (typesafe-sdk 0.7.0) client settings
+  timeout_seconds: 60      # per HTTP attempt
+  max_retries: 2           # SDK default; retries 408 / 429 / 5xx
+  retry_budget_seconds: 180
+  concurrency: 1           # requests in flight per target
+
+# --- Where to send. Only the URL and the key differ between targets. ---
+targets:
+  local:
+    base_url: http://127.0.0.1:8765
+    api_key_env: JEVBERT_API_KEYS   # comma separated; the first key is used
+    dotenv: ../../.env              # written by `python -m jevbert init-env`
+    billable: false
+  jev:
+    base_url: https://api.typesafe.ai
+    api_key_env: TYPESAFE_API_KEY   # not in this repository; set it yourself
+    billable: true                  # `run` refuses without --allow-billable
+
+tasks:
+  # 1. Recent arXiv papers: title + abstract -> primary category (BENCHMARK 2.1).
+  - id: arxiv-primary
+    source:
+      kind: arxiv_snapshot
+      repo: librarian-bots/arxiv-metadata-snapshot    # Cornell arXiv metadata mirror, CC0
+      revision: 90c265d59c8736af2a7b5635ed5eca87b95897c0   # synced 2026-09-21
+      files:
+        - data/train-00000-of-00010.parquet
+        - data/train-00001-of-00010.parquet
+        - data/train-00002-of-00010.parquet
+        - data/train-00003-of-00010.parquet
+        - data/train-00004-of-00010.parquet
+        - data/train-00005-of-00010.parquet
+        - data/train-00006-of-00010.parquet
+        - data/train-00007-of-00010.parquet
+        - data/train-00008-of-00010.parquet
+        - data/train-00009-of-00010.parquet
+      min_yymm: "2606"     # submitted 2026-06 or later
+    state:
+      title: {column: title, max_chars: 300}
+      abstract: {column: abstract, max_chars: 2000}
+    instructions: Which arXiv category is the primary category of this paper?
+    labels:
+      cs.CL: "Computation and Language: natural language processing, computational linguistics, speech and text models"
+      cs.CV: "Computer Vision and Pattern Recognition: image and video understanding, recognition, generation"
+      cs.LG: "Machine Learning (computer science): learning algorithms, deep learning methods, learning theory"
+      cs.AI: "Artificial Intelligence: reasoning, planning, knowledge representation, agents"
+      cs.RO: "Robotics: robot control, manipulation, locomotion, autonomous vehicles"
+      cs.CR: "Cryptography and Security: attacks, defenses, privacy, cryptographic protocols"
+      cs.SE: "Software Engineering: software development, testing, program analysis, tooling"
+      cs.HC: "Human-Computer Interaction: user interfaces, user studies, interaction design"
+      cs.IR: "Information Retrieval: search, ranking, recommender systems"
+      stat.ML: "Machine Learning (statistics): statistical learning theory and methods"
+      stat.ME: "Statistics Methodology: statistical methods, inference, study design"
+      eess.SP: "Signal Processing: signal and communication processing, estimation, detection"
+      math.OC: "Optimization and Control: mathematical optimization, control theory"
+      quant-ph: "Quantum Physics: quantum information, quantum computing, quantum mechanics"
+      cond-mat.mtrl-sci: "Materials Science: properties, synthesis and simulation of materials"
+      astro-ph.GA: "Astrophysics of Galaxies: galaxies, the interstellar medium, star formation"
+    sample:
+      per_label: 15
+
+  # 2. AG News: English news, four sections.
+  - id: ag-news
+    source:
+      kind: hf_parquet
+      repo: fancyzhx/ag_news
+      revision: eb185aade064a813bc0b7f42de02595523103ca4
+      files: [data/test-00000-of-00001.parquet]
+      label_column: label
+      label_values: {"0": world, "1": sports, "2": business, "3": sci_tech}
+    state:
+      text: {column: text, max_chars: 1000}
+    instructions: Which news section does this article belong to?
+    labels:
+      world: "World: international news, politics, diplomacy, conflicts"
+      sports: "Sports: games, athletes, teams, tournaments"
+      business: "Business: companies, markets, the economy, finance"
+      sci_tech: "Science and Technology: science, computing, the internet, technology products"
+    sample:
+      per_label: 50
+
+  # 3. livedoor news corpus: Japanese articles, nine outlets (BENCHMARK 2.2).
+  - id: livedoor
+    source:
+      kind: hf_parquet
+      repo: llm-book/livedoor-news-corpus
+      revision: 28a27caa7263342cf0ff6ecfd973fbcb2015f186   # refs/convert/parquet
+      files: [livedoor-news-corpus/test/0000.parquet]
+      label_column: category
+      label_values:
+        dokujo-tsushin: dokujo-tsushin
+        it-life-hack: it-life-hack
+        kaden-channel: kaden-channel
+        livedoor-homme: livedoor-homme
+        movie-enter: movie-enter
+        peachy: peachy
+        smax: smax
+        sports-watch: sports-watch
+        topic-news: topic-news
+    state:
+      # Corner names such as 【Sports Watch】 nearly name the outlet; they are removed.
+      title: {column: title, max_chars: 200, remove_patterns: ["【[^】]*】"]}
+      body: {column: content, max_chars: 500}
+    instructions: この記事が掲載されたニュース媒体を選んでください。
+    labels:
+      dokujo-tsushin: "独女通信: 独身女性向けの恋愛・結婚・仕事・生き方のコラム"
+      it-life-hack: "ITライフハック: パソコン・ネットサービス・ITの活用術"
+      kaden-channel: "家電チャンネル: 家電・デジタル機器の新製品やレビュー"
+      livedoor-homme: "livedoor HOMME: 男性向けの仕事・ライフスタイル・趣味"
+      movie-enter: "MOVIE ENTER: 映画の公開情報・俳優や監督のニュース"
+      peachy: "Peachy: 女性向けのグルメ・美容・恋愛・エンタメ情報"
+      smax: "エスマックス: スマートフォン・携帯電話の新機種と通信サービス"
+      sports-watch: "Sports Watch: スポーツ選手・試合に関するニュース"
+      topic-news: "トピックニュース: 社会・芸能などの話題のニュース"
+    sample:
+      per_label: 20

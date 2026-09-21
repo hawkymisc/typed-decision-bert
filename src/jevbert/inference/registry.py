@@ -38,7 +38,7 @@ from jevbert.compiler.serializer_nli import (
     template_id_of,
 )
 from jevbert.config import ConfigurationError, Settings
-from jevbert.fetch import model_directory
+from jevbert.fetch import SOURCE_FILES, FetchError, model_directory
 
 logger = logging.getLogger("jevbert.registry")
 
@@ -324,8 +324,22 @@ def _build_nli(manifest: BundleManifest, context: BackendContext) -> Backend:
             f"{manifest.public_id}: the manifest records no source_model.files. "
             "Run `python -m jevbert fetch-model` before starting the server."
         )
+    # The hashes have to cover every file the backend will open, or the check is
+    # decoration: one recorded config.json used to let the server start and load
+    # unverified weights (S-M3). Refusing at startup beats failing at readiness.
+    unverified = sorted(set(SOURCE_FILES) - set(source.files))
+    if unverified:
+        raise ConfigurationError(
+            f"{manifest.public_id}: the manifest records no hash for "
+            f"{', '.join(unverified)}, which the backend loads. "
+            "Run `python -m jevbert fetch-model` before starting the server."
+        )
+    try:
+        directory = model_directory(context.models_dir, source.repo)
+    except FetchError as exc:
+        raise ConfigurationError(f"{manifest.public_id}: {exc}") from exc
     return NliZeroShotBackend(
-        model_directory(context.models_dir, source.repo),
+        directory,
         max_batch_tokens=context.max_batch_tokens,
         max_batch_sequences=context.max_batch_sequences,
         device=context.device,

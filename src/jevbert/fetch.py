@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -49,17 +50,62 @@ SOURCE_FILES: tuple[str, ...] = (
 
 _CHUNK_BYTES = 1 << 20
 
-#: ``snapshot_download``-shaped callable, so the tests never touch the network.
-Downloader = Callable[..., str]
+#: ``owner/name``, and nothing that could be read as a path. ``repo_id.replace("/", "-")``
+#: turns one separator into a directory name and leaves the other one - Windows accepts
+#: ``\`` just as happily - so ``"..\\..\\evil"`` named a directory outside ``models/``
+#: (S-M5). A manifest is configuration, and configuration is checked.
+_REPO_ID = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 
 class FetchError(Exception):
     """Raised when the model cannot be fetched or the manifest cannot be trusted."""
 
 
+def checked_repo_id(repo_id: str) -> str:
+    """The repo ID, or a refusal. One owner, one name, no path separators."""
+    if not _REPO_ID.match(repo_id):
+        raise FetchError(
+            f"{repo_id!r} is not a repo id of the form owner/name, so it cannot name a "
+            "directory under models/."
+        )
+    return repo_id
+
+
+def member_path(directory: Path, name: str) -> Path:
+    """One file *inside* ``directory``, named by the manifest.
+
+    A recorded file name reaches :func:`sha256_file` from the manifest, so a name like
+    ``"../outside.txt"`` would have it hash - and report on - a file the model directory
+    does not contain (S-M5).
+    """
+    if not name or "/" in name or "\\" in name or name in (".", "..") or Path(name).is_absolute():
+        raise FetchError(f"{name!r} is not a file name inside the model directory.")
+    return directory / name
+
+#: ``snapshot_download``-shaped callable, so the tests never touch the network.
+Downloader = Callable[..., str]
+
+
 def model_directory(models_dir: Path, repo_id: str = REPO_ID) -> Path:
     """Where one repo's files live. The owner is kept, flattened into the name."""
-    return models_dir / repo_id.replace("/", "--")
+    return models_dir / checked_repo_id(repo_id).replace("/", "--")
+
+
+def unexpected_files(directory: Path) -> list[str]:
+    """Names in the directory root that :data:`SOURCE_FILES` does not list.
+
+    ``from_pretrained`` opens files in the root by name, so one dropped beside the
+    weights is one the loader may read and the manifest does not vouch for. Only the
+    root is listed: ``.cache/`` is ``huggingface_hub``'s own bookkeeping, written by the
+    download itself, and nothing in the serving path reads it (S-M3).
+    """
+    if not directory.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in directory.iterdir()
+        if entry.is_file() and entry.name not in SOURCE_FILES
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -77,7 +123,7 @@ def hash_files(directory: Path, filenames: Iterable[str]) -> dict[str, str]:
     """SHA-256 of each named file. A missing file is an error, not an empty entry."""
     hashes: dict[str, str] = {}
     for name in filenames:
-        path = directory / name
+        path = member_path(directory, name)
         if not path.is_file():
             raise FetchError(f"{path} is missing.")
         hashes[name] = sha256_file(path)
@@ -88,7 +134,7 @@ def mismatched_files(directory: Path, expected: Mapping[str, str]) -> list[str]:
     """Names whose local bytes are absent or differ from the recorded hash."""
     bad: list[str] = []
     for name, digest in expected.items():
-        path = directory / name
+        path = member_path(directory, name)
         if not path.is_file() or sha256_file(path) != digest:
             bad.append(name)
     return bad
@@ -108,11 +154,16 @@ def record_source_hashes(manifest_path: Path, hashes: Mapping[str, str]) -> None
     conflicts = sorted(
         name for name, digest in recorded.items() if name in hashes and hashes[name] != digest
     )
-    if conflicts:
+    # A name that is recorded and is not in the new set would simply stop being
+    # verified. Dropping it is the same kind of event as changing it - the set of bytes
+    # the bundle vouches for shrinks - so it is refused the same way (S-M4).
+    dropped = sorted(set(recorded) - set(hashes))
+    if conflicts or dropped:
+        detail = ", ".join(conflicts + dropped)
         raise FetchError(
-            f"{manifest_path} already records different hashes for: {', '.join(conflicts)}. "
-            "The manifest was left unchanged. Either the local files are not the pinned "
-            "revision, or the bundle needs a new ID (spec 5.7)."
+            f"{manifest_path} already records different or more hashes than were offered: "
+            f"{detail}. The manifest was left unchanged. Either the local files are not "
+            "the pinned revision, or the bundle needs a new ID (spec 5.7)."
         )
     if recorded == dict(hashes):
         return
@@ -129,8 +180,19 @@ def fetch_model(
     *,
     download: Downloader = snapshot_download,
     manifest_filename: str = MANIFEST_FILENAME,
+    trust_first_fetch: bool = False,
 ) -> int:
     """Fetch the pinned revision if it is not already there, then record its hashes.
+
+    The manifest says which repo and revision the *bundle* is, and this step checks that
+    claim against the constants above rather than following it: a manifest that named
+    another repo would otherwise have this step download it and then write its hashes in
+    as the bundle's identity (S-M4).
+
+    ``trust_first_fetch`` is required when the manifest records no hashes yet. There is
+    then nothing to compare the download against, so whatever the network returns
+    *becomes* the pinned identity, and that is a decision an operator makes rather than
+    something that happens because a field was empty.
 
     Returns a process exit code: 0 on success, 4 on any refusal.
     """
@@ -138,8 +200,8 @@ def fetch_model(
     try:
         payload = _read_manifest_payload(manifest_path)
         source = payload.get("source_model") or {}
-        repo_id = source.get("repo", REPO_ID)
-        revision = source.get("revision", REVISION)
+        repo_id = _check_pinned(source.get("repo", REPO_ID), REPO_ID, "repo")
+        revision = _check_pinned(source.get("revision", REVISION), REVISION, "revision")
         recorded: Mapping[str, str] = source.get("files") or {}
         destination = model_directory(models_dir, repo_id)
 
@@ -158,6 +220,18 @@ def fetch_model(
                     f"{', '.join(bad)}. Nothing was downloaded and nothing was changed. "
                     "Delete the directory to fetch the pinned revision again."
                 )
+        elif not trust_first_fetch:
+            raise FetchError(
+                f"{manifest_path} records no source_model.files, so there is nothing to "
+                "check this download against: whatever is downloaded becomes the bundle's "
+                "pinned identity. Re-run with --trust-first-fetch to accept that."
+            )
+        else:
+            print(
+                "jevbert: --trust-first-fetch - the manifest records no hashes, so the "
+                f"files this download returns will be recorded as what "
+                f"{repo_id}@{revision} is, and every later run is checked against them."
+            )
 
         print(f"jevbert: downloading {repo_id} at revision {revision} into {destination} ...")
         download(
@@ -180,6 +254,16 @@ def fetch_model(
         print(f"  {name}  sha256:{hashes[name]}")
     _report_size(destination, hashes)
     return 0
+
+
+def _check_pinned(declared: Any, pinned: str, field: str) -> str:
+    if declared != pinned:
+        raise FetchError(
+            f"the manifest's source_model.{field} is not the one this build pins. "
+            f"fetch-model downloads {REPO_ID} at {REVISION} and nothing else; a bundle "
+            "that needs different weights needs its own build (spec 15.3)."
+        )
+    return pinned
 
 
 def _report_size(directory: Path, files: Mapping[str, str]) -> None:

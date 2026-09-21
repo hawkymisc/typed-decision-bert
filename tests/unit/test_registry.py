@@ -14,7 +14,7 @@ from jevbert.backends.fake import FakeBackend
 from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.compiler.serializer_nli import NLI_TEMPLATE_ID, template_id_of
 from jevbert.config import ConfigurationError, Limits, ServingSettings
-from jevbert.fetch import model_directory
+from jevbert.fetch import SOURCE_FILES, model_directory
 from jevbert.inference.registry import (
     _BACKEND_FACTORIES,
     BackendContext,
@@ -399,7 +399,8 @@ class TestNliBackendFactory:
         assert "a0-nli-zeroshot-v2" in _BACKEND_FACTORIES
 
     def test_the_model_directory_comes_from_the_manifest_repo(self, tmp_path: Path) -> None:
-        backend = build_backend(self._manifest(), _context(tmp_path))
+        manifest = self._manifest(files=dict.fromkeys(SOURCE_FILES, "ab" * 32))
+        backend = build_backend(manifest, _context(tmp_path))
         assert isinstance(backend, NliZeroShotBackend)
         assert backend.model_dir == model_directory(tmp_path, "MoritzLaurer/bge-m3-zeroshot-v2.0")
 
@@ -415,6 +416,38 @@ class TestNliBackendFactory:
         # promise an identity the loaded bytes never had to match (spec 5.7, 15.3).
         with pytest.raises(ConfigurationError, match="fetch-model"):
             build_backend(self._manifest(files={}), _context(tmp_path))
+
+    def test_hashes_that_do_not_cover_every_loaded_file_refuse_startup(
+        self, tmp_path: Path
+    ) -> None:
+        # S-M3: the verified set and the loaded set were unrelated. One hashed
+        # config.json was enough to start, and model.safetensors - the file that
+        # decides every answer - was then read without ever being checked.
+        with pytest.raises(ConfigurationError, match="model.safetensors"):
+            build_backend(self._manifest(), _context(tmp_path))
+
+    def test_the_full_source_file_set_is_accepted(self, tmp_path: Path) -> None:
+        files = dict.fromkeys(SOURCE_FILES, "ab" * 32)
+        backend = build_backend(self._manifest(files=files), _context(tmp_path))
+        assert isinstance(backend, NliZeroShotBackend)
+
+    def test_extra_recorded_hashes_are_allowed(self, tmp_path: Path) -> None:
+        # Narrower than the loaded set is the failure; wider only means more is
+        # verified than is opened.
+        files = dict.fromkeys(SOURCE_FILES, "ab" * 32) | {"extra.json": "cd" * 32}
+        assert build_backend(self._manifest(files=files), _context(tmp_path)) is not None
+
+    @pytest.mark.parametrize(
+        "repo", ["..\\..\\evil", "../../evil", "a/b/c", "", "owner/", "own er/name", "C:/x/y"]
+    )
+    def test_a_repo_id_that_is_not_a_repo_id_refuses_startup(
+        self, tmp_path: Path, repo: str
+    ) -> None:
+        # S-M5: `repo_id.replace("/", "--")` leaves a Windows separator intact, so a
+        # manifest could name a directory outside models/.
+        files = dict.fromkeys(SOURCE_FILES, "ab" * 32)
+        with pytest.raises(ConfigurationError, match="repo"):
+            build_backend(self._manifest(repo=repo, files=files), _context(tmp_path))
 
 
 class TestSerializerVersionNamesTheTemplate:

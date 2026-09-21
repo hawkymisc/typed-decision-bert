@@ -43,6 +43,14 @@ def main(argv: list[str] | None = None) -> int:
     fetch = subcommands.add_parser("fetch-model", help="download the pinned model revision")
     fetch.add_argument("--manifests-dir", default="manifests", help="default: manifests")
     fetch.add_argument("--models-dir", default="models", help="default: models")
+    fetch.add_argument(
+        "--trust-first-fetch",
+        action="store_true",
+        help=(
+            "accept a download that nothing can be compared against, because the "
+            "manifest records no hashes yet, and record it as the bundle's identity"
+        ),
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=_LOG_FORMAT)
@@ -51,7 +59,11 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "init-env":
         return _init_env(Path(args.path))
-    return fetch_model(Path(args.manifests_dir), Path(args.models_dir))
+    return fetch_model(
+        Path(args.manifests_dir),
+        Path(args.models_dir),
+        trust_first_fetch=args.trust_first_fetch,
+    )
 
 
 def _serve(args: argparse.Namespace) -> int:

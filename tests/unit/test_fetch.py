@@ -167,6 +167,34 @@ class TestRecordSourceHashes:
         assert path.read_text(encoding="utf-8") == before
 
 
+class TestPathsInsideTheModelDirectory:
+    """S-M5: a manifest is configuration, and configuration can be wrong or hostile."""
+
+    @pytest.mark.parametrize(
+        "repo",
+        ["..\\..\\evil", "../../evil", "a/b/c", "", "owner/", "own er/name", "C:/x/y", "/abs/x"],
+    )
+    def test_model_directory_refuses_a_repo_id_that_is_not_one(self, repo: str) -> None:
+        with pytest.raises(FetchError, match="repo"):
+            model_directory(Path("models"), repo)
+
+    def test_model_directory_accepts_the_pinned_repo(self, tmp_path: Path) -> None:
+        assert model_directory(tmp_path, REPO_ID).parent == tmp_path
+
+    @pytest.mark.parametrize(
+        "name", ["../outside.txt", "..\\outside.txt", "sub/config.json", "/etc/passwd", "..", ""]
+    )
+    def test_a_file_name_that_leaves_the_directory_is_refused(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        # `../outside.txt` was measured reading a file outside the model directory.
+        (tmp_path.parent / "outside.txt").write_bytes(b"secret")
+        with pytest.raises(FetchError, match="file name"):
+            mismatched_files(tmp_path, {name: "ab" * 32})
+        with pytest.raises(FetchError, match="file name"):
+            hash_files(tmp_path, [name])
+
+
 class TestFetchModel:
     def test_it_downloads_and_records_hashes(self, tmp_path: Path) -> None:
         manifests = tmp_path / "manifests"
@@ -174,7 +202,7 @@ class TestFetchModel:
         path = write_manifest(manifests)
         downloader = _RecordingDownloader()
 
-        assert fetch_model(manifests, models, download=downloader) == 0
+        assert fetch_model(manifests, models, download=downloader, trust_first_fetch=True) == 0
 
         recorded = json.loads(path.read_text(encoding="utf-8"))["source_model"]["files"]
         expected = {
@@ -186,7 +214,7 @@ class TestFetchModel:
         manifests = tmp_path / "manifests"
         write_manifest(manifests)
         downloader = _RecordingDownloader()
-        fetch_model(manifests, tmp_path / "models", download=downloader)
+        fetch_model(manifests, tmp_path / "models", download=downloader, trust_first_fetch=True)
 
         call = downloader.calls[0]
         assert call["repo_id"] == REPO_ID
@@ -202,7 +230,7 @@ class TestFetchModel:
         write_manifest(manifests)
         downloader = _RecordingDownloader()
 
-        fetch_model(manifests, models, download=downloader)
+        fetch_model(manifests, models, download=downloader, trust_first_fetch=True)
         assert fetch_model(manifests, models, download=downloader) == 0
         assert len(downloader.calls) == 1
 
@@ -213,7 +241,7 @@ class TestFetchModel:
         models = tmp_path / "models"
         write_manifest(manifests)
         downloader = _RecordingDownloader()
-        fetch_model(manifests, models, download=downloader)
+        fetch_model(manifests, models, download=downloader, trust_first_fetch=True)
 
         (model_directory(models) / "config.json").write_bytes(b'{"a": 999}')
         # The manifest already pins this file, so a differing local copy is a
@@ -230,10 +258,118 @@ class TestFetchModel:
         manifests = tmp_path / "manifests"
         models = tmp_path / "models"
         write_manifest(manifests)
-        fetch_model(manifests, models, download=_RecordingDownloader())
+        fetch_model(
+            manifests, models, download=_RecordingDownloader(), trust_first_fetch=True
+        )
         out = capsys.readouterr().out
         assert str(model_directory(models)) in out
         assert REVISION in out
+
+
+class TestTheManifestCannotRedirectTheFetch:
+    """S-M4: `fetch-model` trusted whatever repo and revision the manifest named."""
+
+    def test_a_different_repo_is_refused(self, tmp_path: Path) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(
+            manifests,
+            source_model={"repo": "attacker/backdoor", "revision": REVISION, "files": {}},
+        )
+        downloader = _RecordingDownloader()
+        assert fetch_model(
+            manifests, tmp_path / "models", download=downloader, trust_first_fetch=True
+        ) == 4
+        assert downloader.calls == []
+
+    def test_a_different_revision_is_refused(self, tmp_path: Path) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(
+            manifests, source_model={"repo": REPO_ID, "revision": "0" * 40, "files": {}}
+        )
+        downloader = _RecordingDownloader()
+        assert fetch_model(
+            manifests, tmp_path / "models", download=downloader, trust_first_fetch=True
+        ) == 4
+        assert downloader.calls == []
+
+    def test_the_refusal_names_what_the_code_pins(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(
+            manifests,
+            source_model={"repo": "attacker/backdoor", "revision": REVISION, "files": {}},
+        )
+        fetch_model(manifests, tmp_path / "models", download=_RecordingDownloader())
+        assert REPO_ID in capsys.readouterr().out
+
+
+class TestFirstFetchIsTrustOnFirstUse:
+    """S-M4: with no recorded hashes there is nothing to compare against.
+
+    Whatever the network returns becomes the bundle's identity, so the step has to be
+    asked for rather than happening because the manifest was empty.
+    """
+
+    def test_an_empty_file_map_is_refused_by_default(self, tmp_path: Path) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(manifests)
+        downloader = _RecordingDownloader()
+        assert fetch_model(manifests, tmp_path / "models", download=downloader) == 4
+        assert downloader.calls == []
+
+    def test_the_refusal_names_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(manifests)
+        fetch_model(manifests, tmp_path / "models", download=_RecordingDownloader())
+        assert "--trust-first-fetch" in capsys.readouterr().out
+
+    def test_the_flag_says_what_it_is_agreeing_to(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        manifests = tmp_path / "manifests"
+        write_manifest(manifests)
+        fetch_model(
+            manifests,
+            tmp_path / "models",
+            download=_RecordingDownloader(),
+            trust_first_fetch=True,
+        )
+        out = capsys.readouterr().out
+        assert "trust" in out.lower()
+
+    def test_a_later_run_needs_no_flag(self, tmp_path: Path) -> None:
+        manifests = tmp_path / "manifests"
+        models = tmp_path / "models"
+        write_manifest(manifests)
+        downloader = _RecordingDownloader()
+        fetch_model(manifests, models, download=downloader, trust_first_fetch=True)
+        assert fetch_model(manifests, models, download=downloader) == 0
+
+
+class TestRecordedHashesAreNeverDroppedSilently:
+    def test_a_recorded_name_absent_from_the_new_hashes_is_a_conflict(
+        self, tmp_path: Path
+    ) -> None:
+        # The old code rewrote `files` wholesale, so a name that used to be verified
+        # simply stopped being verified, and the digest moved to say so after the fact.
+        path = write_manifest(tmp_path)
+        record_source_hashes(path, dict.fromkeys(SOURCE_FILES, "ab" * 32))
+        before = path.read_text(encoding="utf-8")
+        with pytest.raises(FetchError, match="config.json"):
+            record_source_hashes(
+                path, {name: "ab" * 32 for name in SOURCE_FILES if name != "config.json"}
+            )
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_adding_a_name_is_still_allowed(self, tmp_path: Path) -> None:
+        path = write_manifest(tmp_path)
+        record_source_hashes(path, {"config.json": "ab" * 32})
+        record_source_hashes(path, {"config.json": "ab" * 32, "tokenizer.json": "cd" * 32})
+        recorded = json.loads(path.read_text(encoding="utf-8"))["source_model"]["files"]
+        assert set(recorded) == {"config.json", "tokenizer.json"}
 
 
 class TestModelDirectory:

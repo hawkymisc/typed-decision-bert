@@ -36,7 +36,7 @@ import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 from jevbert.backends.base import CancelToken, EncodedSequence, TextPair
-from jevbert.fetch import mismatched_files
+from jevbert.fetch import SOURCE_FILES, mismatched_files, unexpected_files
 
 logger = logging.getLogger("jevbert.backend.nli")
 
@@ -590,10 +590,29 @@ class NliZeroShotBackend:
         return values
 
     def _verify_files(self) -> None:
+        """Every file the loader may open, checked before any of them is opened.
+
+        The verified set has to *cover* the loaded set (S-M3): a manifest recording one
+        hash for ``config.json`` used to be enough to start, and ``model.safetensors`` -
+        the bytes that decide every answer - was then read without being checked at all.
+        """
         if not self._expected_file_hashes:
             raise ValueError(
                 "the manifest records no source_model.files, so the weights cannot be "
                 "verified. Run `python -m jevbert fetch-model`."
+            )
+        unverified = sorted(set(SOURCE_FILES) - set(self._expected_file_hashes))
+        if unverified:
+            raise ValueError(
+                f"the manifest records no hash for {', '.join(unverified)}, which this "
+                "backend loads. Run `python -m jevbert fetch-model`."
+            )
+        extra = unexpected_files(self._model_dir)
+        if extra:
+            raise ValueError(
+                f"{self._model_dir} holds {len(extra)} file(s) outside the fetch "
+                f"allow-list: {', '.join(extra)}. The loader reads this directory by "
+                "name, so nothing the manifest does not vouch for may sit in it."
             )
         bad = mismatched_files(self._model_dir, self._expected_file_hashes)
         if bad:

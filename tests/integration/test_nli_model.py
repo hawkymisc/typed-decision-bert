@@ -682,10 +682,11 @@ class TestWeightVerification:
     def test_a_manifest_hash_that_does_not_match_refuses_to_load(
         self, tmp_path: Path
     ) -> None:
-        _, _, directory = require_nli_weights()
-        backend = NliZeroShotBackend(
-            directory, expected_file_hashes={"config.json": "00" * 32}
-        )
+        manifest, _, directory = require_nli_weights()
+        source = manifest.source_model
+        assert source is not None
+        tampered = dict(source.files) | {"config.json": "00" * 32}
+        backend = NliZeroShotBackend(directory, expected_file_hashes=tampered)
         with pytest.raises(ValueError, match="do not match the manifest"):
             backend.load()
 
@@ -693,3 +694,28 @@ class TestWeightVerification:
         _, _, directory = require_nli_weights()
         with pytest.raises(ValueError, match="fetch-model"):
             NliZeroShotBackend(directory, expected_file_hashes={}).load()
+
+    def test_hashes_that_do_not_cover_the_loaded_files_refuse_to_load(self) -> None:
+        # S-M3: verifying config.json alone and then loading model.safetensors is a
+        # check that does not cover the bytes that decide the answers.
+        manifest, _, directory = require_nli_weights()
+        source = manifest.source_model
+        assert source is not None
+        partial = {"config.json": source.files["config.json"]}
+        with pytest.raises(ValueError, match="model.safetensors"):
+            NliZeroShotBackend(directory, expected_file_hashes=partial).load()
+
+    def test_a_file_outside_the_allow_list_refuses_to_load(self, tmp_path: Path) -> None:
+        # `from_pretrained` reads the directory root by name, so a file dropped next to
+        # the weights is a file the loader might open and the manifest does not vouch
+        # for (S-M3). Anything under `.cache/` is huggingface_hub's own bookkeeping and
+        # is not read by the loader, so only the root is policed.
+        manifest, _, directory = require_nli_weights()
+        source = manifest.source_model
+        assert source is not None
+        for name in source.files:
+            (tmp_path / name).write_bytes((directory / name).read_bytes())
+        (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+        backend = NliZeroShotBackend(tmp_path, expected_file_hashes=source.files)
+        with pytest.raises(ValueError, match="adapter_config.json"):
+            backend.load()

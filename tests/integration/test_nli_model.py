@@ -29,7 +29,13 @@ from jevbert.backends.nli import (
 from jevbert.config import Limits, ServingSettings, Settings
 from jevbert.inference.registry import Bundle, ModelRegistry
 from jevbert.scoring.numeric import probabilities_from_logits
-from tests.conftest import API_KEY, AUTH, MODELS_DIR, require_nli_weights
+from tests.conftest import (
+    API_KEY,
+    AUTH,
+    MODELS_DIR,
+    build_nli_backend,
+    require_nli_weights,
+)
 
 pytestmark = pytest.mark.model
 
@@ -81,10 +87,17 @@ def cpu_backend() -> NliZeroShotBackend:
 
 
 @pytest.fixture(scope="module")
-def nli_client(nli_backend: NliZeroShotBackend) -> Any:
-    """A server serving the real bundle, sharing the session's loaded backend."""
+def nli_client() -> Any:
+    """A server serving the real bundle, on a backend of its own (A-H1).
+
+    Not the session's ``nli_backend``: the app drives it from the engine's encoder and
+    inference threads, and ``registry.load_all()`` would be a *second* ``load()`` on an
+    instance other tests are calling directly. Both break the contract in
+    ``backends/base.py``, and the symptom is a test that fails only when another one
+    ran beside it.
+    """
     manifest, digest, _ = require_nli_weights()
-    bundle = Bundle(manifest, digest, nli_backend)
+    bundle = Bundle(manifest, digest, build_nli_backend())
     registry = ModelRegistry([bundle])
     registry.load_all()
     settings = Settings(

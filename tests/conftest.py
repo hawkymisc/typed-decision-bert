@@ -125,17 +125,34 @@ def require_nli_weights() -> tuple[BundleManifest, str, Path]:
     return manifest, digest, directory
 
 
-@pytest.fixture(scope="session")
-def nli_backend() -> NliZeroShotBackend:
-    """The real backend, loaded once for the whole session.
+def build_nli_backend() -> NliZeroShotBackend:
+    """One real backend, built but **not** loaded.
 
     Built through ``build_backend`` rather than by hand, so that the tests exercise the
     same manifest-to-backend wiring the server uses - including the dtype the manifest
     declares.
+
+    Every caller gets its own instance. ``backends/base.py`` says ``count_and_encode``
+    is called from a single encoder thread, and ``load()`` is called once; handing one
+    instance to a test that drives it directly *and* to an ``InferenceEngine`` that
+    drives it from its own thread breaks both (A-H1). Loading is a couple of seconds and
+    about 2.2 GB of VRAM, which is the price of tests that cannot interfere.
     """
     manifest, _, _ = require_nli_weights()
     settings = build_settings(models_dir=MODELS_DIR)
     backend = build_backend(manifest, backend_context(settings))
     assert isinstance(backend, NliZeroShotBackend)
+    return backend
+
+
+def load_nli_backend() -> NliZeroShotBackend:
+    """One real backend of its own, loaded once. For tests that call it directly."""
+    backend = build_nli_backend()
     backend.load()
     return backend
+
+
+@pytest.fixture(scope="session")
+def nli_backend() -> NliZeroShotBackend:
+    """The real backend for tests that call it directly, loaded once per session."""
+    return load_nli_backend()

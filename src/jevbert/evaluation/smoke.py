@@ -123,7 +123,12 @@ def load_cases(directory: Path) -> list[SmokeCase]:
 
 @dataclass(frozen=True)
 class SmokeResult:
-    """One case's outcome. Exactly one of ``correct`` and ``error`` is set."""
+    """One case's outcome. Exactly one of ``correct`` and ``error`` is set.
+
+    Enforced rather than documented (A-L): ``metric`` averages one field and
+    ``failures`` reads the other, so a result carrying neither is silently dropped from
+    an accuracy and a result carrying both is counted twice over.
+    """
 
     case_id: str
     language: str
@@ -132,6 +137,13 @@ class SmokeResult:
     correct: bool | None = None
     #: Score: ``|score - expected| / (K - 1)``. ``None`` for Noul and Choice.
     error: float | None = None
+
+    def __post_init__(self) -> None:
+        if (self.correct is None) == (self.error is None):
+            raise ValueError(
+                f"{self.case_id}: a result sets exactly one of correct and error, "
+                f"not {'both' if self.correct is not None else 'neither'}"
+            )
 
 
 def score_case(case: SmokeCase, answer: Answer) -> SmokeResult:
@@ -201,8 +213,20 @@ class SmokeReport:
     def count(self, question_type: str, language: str | None = None) -> int:
         return len(self.select(question_type, language))
 
-    def failures(self) -> list[SmokeResult]:
-        return [result for result in self.results if result.correct is False]
+    def failures(self, *, score_error_above: float = 0.5) -> list[SmokeResult]:
+        """Cases worth looking at: a wrong answer, or a Score a long way off.
+
+        Score had no failures at all before, because it has no boolean to be false, so
+        an assertion message about a Score regression named no case (A-L). Half the
+        rubric's span is the default line: at that distance the answer is closer to a
+        different level than to the right one.
+        """
+        return [
+            result
+            for result in self.results
+            if result.correct is False
+            or (result.error is not None and result.error > score_error_above)
+        ]
 
     def summary(self) -> dict[str, Any]:
         """A JSON-serialisable summary, disclaimer included."""
@@ -252,7 +276,64 @@ class SmokeReport:
             )
             if counts:
                 lines.append(f"{question_type}: {self.count(question_type)} cases ({counts})")
+        failures = self.failures()
+        if failures:
+            lines.append("")
+            lines.append(f"{len(failures)} case(s) to look at:")
+            for result in failures:
+                if result.error is None:
+                    lines.append(f"  {result.case_id:<28} {result.question_type} answered wrongly")
+                else:
+                    lines.append(
+                        f"  {result.case_id:<28} {result.question_type} "
+                        f"|err|/(K-1) = {result.error:.3f}"
+                    )
         return "\n".join(lines)
+
+
+def uninformative_baselines(cases: Sequence[SmokeCase]) -> dict[str, float]:
+    """What the best predictor that never reads the question scores on these cases.
+
+    A floor below this number is not a regression guard: mutation testing showed a Noul
+    backend pinned to a constant and a Score backend pinned to the middle level passing
+    every floor the first release shipped (Q-H1). Computed from the fixture rather than
+    written down, so adding cases moves the baseline instead of quietly invalidating it.
+
+    * **noul** - the better of always-yes and always-no.
+    * **choice** - the better of guessing uniformly (``mean 1/K``) and always naming the
+      single key that is most often right.
+    * **score** - the smallest mean ``|score - expected| / (K - 1)`` any constant answer
+      can reach. A constant is a fixed *position* in the rubric, because ``K`` varies;
+      the minimum is at the median of the normalised targets. **Lower is better here**,
+      so a ceiling has to sit below this number.
+    """
+    baselines: dict[str, float] = {}
+
+    noul = [case for case in cases if case.question_type == "noul"]
+    if noul:
+        yes = sum(1 for case in noul if bool(case.expected))
+        baselines["noul"] = max(yes, len(noul) - yes) / len(noul)
+
+    choice = [case for case in cases if case.question_type == "choice"]
+    if choice:
+        guessing = statistics.fmean(1.0 / len(case.criteria) for case in choice)
+        keys = {key for case in choice for key in case.criteria}
+        constant = max(
+            (
+                statistics.fmean(1.0 if case.expected == key else 0.0 for case in choice)
+                for key in keys
+            ),
+            default=0.0,
+        )
+        baselines["choice"] = max(guessing, constant)
+
+    score = [case for case in cases if case.question_type == "score"]
+    if score:
+        targets = [float(case.expected) / (case.level_count - 1) for case in score]
+        best = statistics.median(targets)
+        baselines["score"] = statistics.fmean(abs(best - target) for target in targets)
+
+    return baselines
 
 
 def _cell(value: float | None) -> str:

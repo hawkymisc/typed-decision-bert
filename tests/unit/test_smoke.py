@@ -24,6 +24,7 @@ from jevbert.evaluation.smoke import (
     parse_case,
     run_smoke,
     score_case,
+    uninformative_baselines,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "smoke"
@@ -39,6 +40,10 @@ def choice_case(expected: str) -> SmokeCase:
 
 def score_case_fixture(expected: int) -> SmokeCase:
     return SmokeCase("c", "ja", "score", "s", "i?", expected, ["low", "mid", "high"])
+
+
+def choice_case_over(criteria: dict[str, Any], expected: str) -> SmokeCase:
+    return SmokeCase("c", "en", "choice", "s", "i?", expected, criteria)
 
 
 class TestFixtures:
@@ -213,8 +218,88 @@ class TestReport:
         assert DISCLAIMER in text
         assert "noul" in text and "score" in text
 
-    def test_failures_list_only_wrong_answers(self) -> None:
-        assert [result.case_id for result in self._report().failures()] == ["b"]
+    def test_failures_list_wrong_answers_and_distant_scores(self) -> None:
+        # A-L: Score has no boolean to be false, so before this it contributed nothing
+        # to an assertion message about a Score regression.
+        assert [result.case_id for result in self._report().failures()] == ["b", "f"]
+
+    def test_the_score_threshold_can_be_moved(self) -> None:
+        assert [result.case_id for result in self._report().failures(score_error_above=0.9)] == [
+            "b"
+        ]
+        assert [
+            result.case_id for result in self._report().failures(score_error_above=0.1)
+        ] == ["b", "e", "f"]
+
+    def test_the_text_report_shows_the_score_error(self) -> None:
+        text = self._report().format_report()
+        assert "0.750" in text
+        assert "f " in text
+
+
+class TestAResultSetsExactlyOneOutcome:
+    """A-L: the invariant in the docstring is now the one the constructor enforces."""
+
+    def test_neither_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="neither"):
+            SmokeResult("a", "ja", "noul")
+
+    def test_both_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="both"):
+            SmokeResult("a", "ja", "score", correct=True, error=0.1)
+
+    def test_a_false_correct_is_still_an_outcome(self) -> None:
+        # `correct=False` is falsy, so a check written with `if not correct` would read
+        # a wrong answer as a missing one.
+        assert SmokeResult("a", "ja", "noul", correct=False).correct is False
+
+    def test_a_zero_error_is_still_an_outcome(self) -> None:
+        assert SmokeResult("a", "ja", "score", error=0.0).error == 0.0
+
+
+class TestUninformativeBaselines:
+    """Q-H1: what a predictor that never reads the question would score."""
+
+    def test_a_balanced_noul_fixture_gives_one_half(self) -> None:
+        cases = [noul_case(True), noul_case(False), noul_case(True), noul_case(False)]
+        assert uninformative_baselines(cases)["noul"] == pytest.approx(0.5)
+
+    def test_an_unbalanced_noul_fixture_gives_the_majority(self) -> None:
+        cases = [noul_case(True), noul_case(True), noul_case(True), noul_case(False)]
+        assert uninformative_baselines(cases)["noul"] == pytest.approx(0.75)
+
+    def test_choice_is_at_least_uniform_guessing(self) -> None:
+        options = {"a": None, "b": None, "c": None, "d": None}
+        # Four options, and every key is right exactly once, so no constant answer beats
+        # guessing and the baseline is 1/K.
+        cases = [choice_case_over(dict(options), key) for key in options]
+        assert uninformative_baselines(cases)["choice"] == pytest.approx(0.25)
+
+    def test_choice_notices_a_key_that_is_usually_right(self) -> None:
+        options = {"a": None, "b": None, "c": None, "d": None}
+        cases = [choice_case_over(dict(options), "a") for _ in range(3)] + [
+            choice_case_over(dict(options), "b")
+        ]
+        # Always answering "a" scores 0.75, well above uniform guessing.
+        assert uninformative_baselines(cases)["choice"] == pytest.approx(0.75)
+
+    def test_score_is_the_best_constant_position(self) -> None:
+        # Targets 0, 0.5, 1 normalised: the median is 0.5 and the mean distance to it
+        # is 1/3. Nothing constant does better.
+        cases = [score_case_fixture(level) for level in (0, 1, 2)]
+        assert uninformative_baselines(cases)["score"] == pytest.approx(1 / 3)
+
+    def test_a_type_with_no_cases_has_no_baseline(self) -> None:
+        assert "score" not in uninformative_baselines([noul_case(True)])
+
+    def test_the_shipped_fixture_baselines_are_the_recorded_ones(self) -> None:
+        # POC_RESULTS 4.2 publishes these beside the measurements, so a fixture change
+        # that moves them has to move the document too.
+        cases = load_cases(FIXTURES)
+        baselines = uninformative_baselines(cases)
+        assert baselines["noul"] == pytest.approx(0.500)
+        assert baselines["choice"] == pytest.approx(0.260, abs=5e-4)
+        assert baselines["score"] == pytest.approx(0.375)
 
 
 class TestRunSmoke:

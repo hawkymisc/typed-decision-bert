@@ -2,10 +2,10 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 0.2.0（2026-09-21。フェーズ1.5のレビュー指摘を§12.2に反映し、本文の該当箇所を追従させた） |
-| 上位文書 | [JevBERT 仕様・設計書 v0.2.0](../JevBERT_spec_design.md)（以下「仕様書」。`§5.3`のように節を参照する） |
+| 文書バージョン | 0.3.0（2026-09-21。フェーズ2の実測と互換性優先（ADR-016）を§12.3に反映し、本文の該当箇所を追従させた） |
+| 上位文書 | [JevBERT 仕様・設計書 v0.3.0](../JevBERT_spec_design.md)（以下「仕様書」。`§5.3`のように節を参照する） |
 | 目的 | 個人PoC用途で、Jev互換APIサーバーをこのマシン上で動作させる |
-| ステータス | 実装前に固定した設計（基準線）。実装・検証で判明した差分は第12章に追記する |
+| ステータス | 実装前に固定した設計（基準線）。実装・検証で判明した差分は第12章に追記する。**実測値は[docs/POC_RESULTS.md](POC_RESULTS.md)** |
 
 本書は仕様書の**P0.5段階（§19）**の実装設計である。仕様書と本書が矛盾する場合は仕様書を正とし、本書を直す。本書にしかない決定（テンプレート、モジュール構成、PoC制限値など）はPoC限りの決定であり、仕様書のbundle契約を変更しない。
 
@@ -151,12 +151,12 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
 
 付録Aと同じ構造規則を、parse済みのPython値に対して手続き的に検証し、最初の違反の`path`（例：`["questions","department","criteria"]`）を返す。pydanticの暗黙変換に依存しない。付録Aのschemaファイルと実装の判定が一致することをproperty-based testで確認する（第8章 PT03）。
 
-- トップレベルとQuestionの未知フィールドは422。stateや構造化説明の内部キーには未知フィールド規則を適用しない。
+- **トップレベルの未知フィールドは既定で無視する**（設定`compat.unknown_top_level_fields: reject`で422に戻せる）。**Questionの未知フィールドは422**。stateや構造化説明の内部キーには未知フィールド規則を適用しない（仕様書§5.3、ADR-016）。
 - `instructions`は省略とnullを同一視（SDK 0.7.0は省略する。§3.4）。
 - Noul `criteria`：省略・null・`{}`・片側のみを受理。キーは`"true"`・`"false"`のみ。
 - Choice `criteria`：2〜255件。値はEntry（nullは「キーだけで候補を表す」）。空文字列のキーも構造上は受理する。
 - Score `criteria`：2〜10件のContent。nullの段階は422（U02）。
-- 質問数1〜32。
+- 質問数1〜256（仕様書§4.2。Jevに件数の上限の記載がないため、件数だけを理由に拒否しない）。
 
 ### 4.3 認証
 
@@ -178,7 +178,7 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
 
 ### 4.5 エラー
 
-本文は§5.9の形式に固定する。`path`は該当箇所が特定できる場合のみ含める。`retryable`は429・503・504・529でtrue、それ以外はfalse。529と503には`Retry-After: 1`を付ける。FastAPI・Starlette既定のエラー本文を露出させない（`RequestValidationError`・`HTTPException`・未捕捉例外の全ハンドラを登録）。未捕捉例外は500 `internal_error`とし、詳細はログにのみ出す（入力値を含めない）。
+本文は§5.9の形式に固定する。**422に限り、Jevのschemaと同形の`detail`配列を`error`と併記する**（`[{"loc","msg","type"}]`、`loc`は`["body"] + path`で、pathが質問の内部を指し型が判別できた場合のみ質問IDの直後に型tagを挿入する。`input`・`ctx`は入力値を反射するため付けない。仕様書§5.9、ADR-016）。`path`は該当箇所が特定できる場合のみ含める。`retryable`は429・503・504・529でtrue、それ以外はfalse。529と503には`Retry-After: 1`を付ける。FastAPI・Starlette既定のエラー本文を露出させない（`RequestValidationError`・`HTTPException`・未捕捉例外の全ハンドラを登録）。未捕捉例外は500 `internal_error`とし、詳細はログにのみ出す（入力値を含めない）。
 
 ### 4.6 Readiness
 
@@ -245,17 +245,29 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
 指示なし: "{C}"
 ```
 
-テンプレートは品質に直結するが事前に最適形を決められない（既知の未知数K4）。実装時に2〜3案（例：`Question: {I} Answer: {C}`、`Regarding "{I}", the correct answer is: {C}`）をsmoke評価で比較し、採用案と比較結果を`docs/POC_RESULTS.md`に記録して**manifestの`serializer_version`とともに固定**する。テンプレートを変えたらbundle IDを変える（§5.7）。
+テンプレートは品質に直結するが事前に最適形を決められない（既知の未知数K4）。実装時に3案をsmoke評価で比較した（`scripts/compare_templates.py`）。
+
+| ID | 指示あり | 指示なし |
+| --- | --- | --- |
+| `nli-template-v1`（**採用**） | `{I} — {C}` | `{C}` |
+| `nli-template-v2` | `Question: {I} Answer: {C}` | `Answer: {C}` |
+| `nli-template-v3` | `「{I}」の答えは「{C}」である。` / `The answer to "{I}" is "{C}".` | 同様の自然文 |
+
+**結果：3案は二値36件中32件で一致し、fixture（n=52）では精度で優劣を決められなかった。** したがって決め手を構造的コストとし、文字種判定を必要とせず区切りが言語中立な`nli-template-v1`を維持した。比較結果と判断理由の全文はPOC_RESULTS 第3章。不採用案も`TEMPLATES`に残し、再実行可能にしてある。
+
+採用案は`serializer_version`（`serializer-nli-v1+nli-template-v1`）として固定し、一致しないmanifestは起動を拒否する。テンプレートを変えたらbundle IDを変える（§5.7）。
 
 ### 5.4 tokenizeと制御IDの分離（§6.2、CT11）
 
-premiseとhypothesisは**別々に**、`add_special_tokens=False`かつ特殊token文字列を通常文字として分割する設定（`split_special_tokens=True`相当）でtoken化する。系列はcompilerがIDで組み立てる：
+premiseとhypothesisは**別々に**`add_special_tokens=False`でtoken化する。系列はcompilerがIDで組み立てる：
 
 ```text
 [bos] + premise_ids + [eos, eos] + hypothesis_ids + [eos]      # XLM-RoBERTaのpair形式
 ```
 
-これにより、ユーザーデータ中の`</s>`・`<s>`・`<mask>`・`<pad>`等が制御tokenとして解釈されない。**系列中の特殊token IDの個数が常にちょうど4であること**をテストする。tokenizerがこの設定を正しく扱えない場合は、実装前に挙動を観測し、代替（特殊token文字列のエスケープ）を本書に追記してから進める。
+**`split_special_tokens=True`は実測で効かなかった**（K2。制御token IDが6個データ中に残った。§12.3、POC_RESULTS §5.2）。代替として、token化の直前に**予約文字列（`</s>` `<s>` `<pad>` `<unk>` `<mask>`）の1文字目`<`の直後へ空白を1つ挿入する**escapeをpremiseとhypothesisの両方に適用する（`"a<s>b"` → `"a< s>b"`）。大文字（`<S>`等）はtokenizerが特殊tokenとして照合しないためescapeしない。
+
+これにより、ユーザーデータ中の`</s>`・`<s>`・`<mask>`・`<pad>`等が制御tokenとして解釈されない。**系列中の制御token IDの個数が常にちょうど4であること**をbackend内部でassertし、違反は例外にする（CT11）。ここで数える制御tokenに`<unk>`は含めない：語彙にない文字を表すデータtokenであり、数えると珍しいが正当な入力が500になるためである。escapeによってモデルが読むテキストが元の入力と一致しなくなる点は`compat/differences.md` L08に記録した。
 
 ### 5.5 token予算
 
@@ -296,7 +308,7 @@ logit＝`sha256(premise ‖ 0x1f ‖ hypothesis)`の先頭8バイトを`[-4, 4]`
 - モデル：`MoritzLaurer/bge-m3-zeroshot-v2.0` @ `9abf1c8aaeb82a2447809c20753ed0b106b76652`、`AutoModelForSequenceClassification`、`trust_remote_code=False`、`local_files_only=True`、safetensorsのみ。
 - entailmentのindexは`config.id2label`から名前で解決し、`entailment`が見つからなければロード失敗とする（index 0を決め打ちしない）。
 - logit：2クラスのlogitを`z_ent, z_not`として`z = z_ent − z_not`（§7.7のlog-oddsと等価）。FP32へ変換してから計算する。
-- 実行：`model.eval()`、`torch.inference_mode()`。deviceは`auto`（CUDAがあればCUDA）。CUDAではFP16、CPUではFP32。dtypeはmanifestに記録する。
+- 実行：`model.eval()`、`torch.inference_mode()`。deviceは`auto`（CUDAがあればCUDA）。**dtypeはmanifestの`dtype`が決める**（`float32`/`float16`/`bfloat16`/`auto`。`auto`がCUDAでFP16という当初の既定）。CPUは常にFP32。**PoC bundleは`float32`を宣言する**：FP16はK3の許容誤差を満たさなかった（§12.3、POC_RESULTS §5.3）。
 - microbatch：系列を長さ順に並べ、「batch内最大長×件数 ≦ `max_batch_tokens`（既定16,384）」かつ「件数 ≦ 64」で区切る。結果は元の順へ戻す。microbatchの間で`cancel`を確認する。
 - CUDA OOMは500 `inference_error`として文脈付きでログし、キャッシュを解放して次のリクエストを処理可能に保つ。
 
@@ -317,7 +329,9 @@ logit＝`sha256(premise ‖ 0x1f ‖ hypothesis)`の先頭8バイトを`[-4, 4]`
 
 `python -m jevbert fetch-model`が、固定revisionを`models/`（gitignore対象）へ取得し、ファイルhashをmanifestへ書き込む（ADR-014）。サーバーはネットワークからモデルを取得しない（`HF_HUB_OFFLINE=1`相当）。利用者が指定した任意のHF ID・URLはロードしない。
 
-alias（例：`jev-latest`）は`allow_jev_aliases: true`かつ明示的な対応表があるときだけ有効。`response.model`は常に不変ID（§2.3）。未登録の`jev-*`をワイルドカードで受理しない。
+alias（例：`jev-latest`）は`allow_jev_aliases: true`かつ明示的な対応表があるときだけ有効。**ソフトウェアの既定は無効のままだが、`configs/jevbert.poc.yaml`では`jev-latest`・`jev-preview`を明示的に有効化する**（公式SDKの既定modelが`jev-latest`であり、接続先とAPI keyの変更だけで動くこと（C2）を実演するため。仕様書§18.3、ADR-016）。`response.model`は常に不変ID（§2.3）。未登録の`jev-*`をワイルドカードで受理しない。
+
+manifestの`serializer_version`はテンプレートIDを含む（`serializer-nli-v1+nli-template-v1`）。**この build がコンパイルするテンプレートと一致しないmanifestは起動を拒否する**（bundle IDが約束するモデル入力と実際のモデル入力が食い違わないようにするため。§5.7）。
 
 ---
 
@@ -347,11 +361,11 @@ TDDで進める：仕様（仕様書＋本書）からテストを先に書き�
 
 | ID | 内容 | PoCでの扱い |
 | --- | --- | --- |
-| CT01 | 3型の単独・混在、1質問・32質問・33質問 | 実施 |
+| CT01 | 3型の単独・混在、1質問・256質問・257質問 | 実施 |
 | CT02 | string・array・nested objectのstate・instructions・criteria、`legend`の型保持 | 実施 |
 | CT03 | Choiceのnull説明、Noulの片側・空・null criteria、instructionsの省略・null同値 | 実施 |
 | CT04 | Choice 1/2/255/256、Score 1/2/10/11 | 実施（255はfake backendで） |
-| CT05 | 空questions、未知type、未知フィールド、NaN、重複キー、BOM、孤立surrogate、top-levelがnull/number/booleanのstate、boolean→numberの非変換 | 実施。部分200が無いことを確認 |
+| CT05 | 空questions、未知type、Questionの未知フィールド、トップレベル未知フィールド（既定で無視・`reject`設定で422）、NaN、重複キー、BOM、孤立surrogate、top-levelがnull/number/booleanのstate、boolean→numberの非変換 | 実施。部分200が無いことを確認（`tests/contract/test_compat.py`） |
 | CT06 | token上限の直前・一致・超過、body 2 MiBの境界、深さ32/33 | 実施。切り詰めが無いこと（受理時のtoken数＝全文のtoken数） |
 | CT07 | 同率・極端logit（±1e4）・一様logit | 実施（`logit_fn`注入） |
 | CT08 | NaN・inf logit、候補数とlogit数の不一致 | 実施。500で、確率を含む本文を返さない |
@@ -372,7 +386,7 @@ TDDで進める：仕様（仕様書＋本書）からテストを先に書き�
 
 ### 8.3 SDK試験（実ソケット）
 
-uvicornを別スレッドまたは別プロセスで空きポートに起動し、`TypeSafeClient`・`AsyncTypeSafeClient`（0.7.0）で確認する項目は仕様書§13.7のとおり。加えて、`Noul(criteria={"true": ...})`の片側指定、`Score`の構造化criteriaと`legend`の型保持、`extra_body`で未知フィールドを送ると422になること、429・5xxでのSDK再試行を止めるため試験では`RetryPolicy(max_retries=0)`を指定することを含める。
+uvicornを別スレッドまたは別プロセスで空きポートに起動し、`TypeSafeClient`・`AsyncTypeSafeClient`（0.7.0）で確認する項目は仕様書§13.7のとおり。加えて、`Noul(criteria={"true": ...})`の片側指定、`Score`の構造化criteriaと`legend`の型保持、**`extra_body`で未知トップレベルフィールドを送ると既定では200で無視され`reject`設定では422になること**、**modelを指定しない（SDK既定の`jev-latest`）呼び出しがaliasで解決すること**、**422本文の`detail`配列をSDK経由で読めること（`loc[0] == "body"`）と、その併記が例外メッセージを変えないこと**、429・5xxでのSDK再試行を止めるため試験では`RetryPolicy(max_retries=0)`を指定することを含める。
 
 ### 8.4 実モデルintegrationとsmoke評価
 
@@ -389,6 +403,8 @@ uvicornを別スレッドまたは別プロセスで空きポートに起動し�
 ## 9. 非機能要件の一覧（READMEの充足表の元）
 
 READMEでは各項目を**充足／部分充足／未充足**に分類し、根拠（テスト名・計測値・未実装理由）を添える。下表の「見込み」は実装前の想定であり、READMEには実測・実装結果を書く。
+
+> **実装後の結果は[README](../README.md)の「非機能要件の充足状況」が正である**（充足13／部分充足2／未充足8）。下表と食い違う場合はREADMEを正とし、差は§12.3に記す。実測との差はN08（充足見込み→**充足**、hash照合を実装）とN14（実測して記載→**充足**、p95 34.2 ms）の2件のみで、他は見込みどおりである。
 
 | ID | 要件（出典） | 見込み |
 | --- | --- | --- |
@@ -438,11 +454,11 @@ uv run pytest                                # 全テスト
 | ID | 未知数 | 起きたときの切り分け |
 | --- | --- | --- |
 | K1 | Python 3.13 + Windows + RTX 5090で動くPyTorch wheelの組み合わせ | `torch.cuda.is_available()`とsm_120対応を最初に確認。だめならCUDA版index・Python 3.11を順に試す |
-| K2 | XLM-RoBERTa fast tokenizerで`split_special_tokens`が期待どおり働くか | 5.4節の「特殊token IDがちょうど4個」テストで検出。だめならエスケープ方式へ |
-| K3 | FP16でのlogitの安定性、batch形状による数値差 | FP32 CPU結果との差を計測。`1e-3`を超えるならBF16/FP32へ |
-| K4 | hypothesisテンプレートの品質、日本語の指示＋英語の既定Noul文の混在 | smoke評価でテンプレート比較 |
+| K2 | XLM-RoBERTa fast tokenizerで`split_special_tokens`が期待どおり働くか | 5.4節の「特殊token IDがちょうど4個」テストで検出。だめならエスケープ方式へ → **働かなかった。エスケープ方式を採用（§12.3）** |
+| K3 | FP16でのlogitの安定性、batch形状による数値差 | FP32 CPU結果との差を計測。`1e-3`を超えるならBF16/FP32へ → **確率差4.2e-3で超過。FP32へ切り替えた（§12.3）** |
+| K4 | hypothesisテンプレートの品質、日本語の指示＋英語の既定Noul文の混在 | smoke評価でテンプレート比較 → **3案がほぼ同等。`nli-template-v1`を維持（§12.3）** |
 | K5 | SDKの`strict=True`検証が、整数値に見えるfloat（`1.0`）や指数表記を受理するか | SDK実ソケット試験で確認 |
-| K6 | 他プロセスが使用中のVRAM（約6 GB）との共存 | モデルはFP16で約1.2 GB。OOM時はbatch token上限を下げる |
+| K6 | 他プロセスが使用中のVRAM（約6 GB）との共存 | モデルはFP16で約1.2 GB。OOM時はbatch token上限を下げる → **FP32約2.2 GBで共存。OOMは一度も発生せず（§12.3）** |
 | K7 | uvicornのbody受信上限・切断検知の挙動 | CT06・CT10で確認 |
 
 ---
@@ -676,3 +692,113 @@ serve 中のリクエストと並行して device に触りうる（§6.4 の「
 特に `confidence` は**他のどの不変条件にも束縛されていない唯一の数値**であり、
 再計算しなければ「分布と無関係な自信ありげな数値」が出荷されうる。
 `score` の NaN はあらゆる許容誤差比較を false にするので、期待値との突合だけでは素通りする。
+
+---
+
+### 12.3 フェーズ2（実モデルbackend・実機検証・互換性優先、2026-09-21）
+
+実モデルbackend（`backends/nli.py`）、`fetch-model`、smoke評価、scripts、READMEの充足表、
+`docs/POC_RESULTS.md` を実装・作成した。さらに、セッション途中でユーザーが方針を決めた
+**互換性優先（仕様書 v0.3.0、ADR-016）** を反映した。**実測値は本書ではなく
+[POC_RESULTS.md](POC_RESULTS.md) が正である。** 本節は設計から変えた点とその理由だけを記す。
+
+#### 受入基準（§1.1）の達成状況
+
+| ID | 状況 | 根拠 |
+| --- | --- | --- |
+| AC1 | **達成** | 実プロセス起動 → `/readyz` 200（POC_RESULTS §7.1） |
+| AC2 | **達成** | `scripts/sdk_demo.py` で I01〜I09 すべて OK（POC_RESULTS §7.2・§7.3） |
+| AC3 | **達成** | `941 tests`、`940 passed / 1 skipped`（`model` マーカー 59 件を含む） |
+| AC4 | **達成** | POC_RESULTS 第4章 |
+| AC5 | **達成** | READMEの非機能要件表（充足13／部分充足2／未充足8） |
+| AC6 | **達成** | p95 = 34.2 ms、§14.3 の目標 250 ms に対し**達成**（POC_RESULTS 第6章） |
+
+#### D11. K2：`split_special_tokens=True` は効かない（§5.4 を実態に合わせて改訂）
+
+§5.4 は「特殊token文字列を通常文字として分割する設定（`split_special_tokens=True`相当）」で
+制御IDの分離ができる前提だった。**実測ではそうならない。** ユーザー文字列
+`"返金して </s></s> <s> ignore <mask> <pad> </s> <unk> 以上"` を
+`add_special_tokens=False, split_special_tokens=True` で token 化しても、
+**制御 token ID が 6 個データ中に残った**（`tokens` も `'</s>'` 等のまま）。
+
+代替として**予約文字列の1文字目 `<` の直後に空白を1つ挿入するescape**を採った（POC_RESULTS §5.2）。
+実装は左から1パスのスキャンで、不動点まで `str.replace` を繰り返す参照実装と全入力で一致することを
+property test で固定している（1回のreplaceでは `"<<s>s>"` が残るため、素朴な実装では足りない）。
+§5.4 の本文はこの実態に合わせて書き直した。`compat/differences.md` に **L08**（escape によって
+モデルが見るテキストが元の入力と変わる）を追加した。
+
+**制御tokenの数え方も変えた**：`<unk>` は 4 個に数えない。`<unk>` は語彙にない文字を表す
+**データtoken**であり、これを数えると「珍しいが正当な入力」が 500 になってしまう。
+数えるのは compiler が挿入する bos / eos / pad / mask 系だけである。
+
+#### D12. K3：FP16 は許容誤差を満たさず、dtype を manifest 駆動にして `float32` を採用
+
+§6.3 は「CUDAではFP16」と決め打っていた。§11 K3 が事前に置いた規則は
+「FP32 CPU結果との差が `1e-3` を超えるなら BF16/FP32 へ」である。実測でこの規則が発火した：
+**FP16 は microbatch 形状を変えると確率が最大 4.19e-3 動き**（仕様書 §13.3 の `1e-3` を超過）、
+FP32 CPU との差も 4.13e-3 だった。FP32 に切り替えると batch 形状差 1.63e-6・CPU 差 2.69e-6 まで下がり、
+代償は 32 系列あたり +10.3 ms（9.2 → 19.5 ms）にすぎない。§14.3 の 250 ms に対して無視できる。
+
+**設計変更**：dtype を backend のハードコードから **manifest の `dtype` フィールド**へ移した
+（`float32`/`float16`/`bfloat16`/`auto`。`auto` が §6.3 当初の「CUDAでFP16」）。
+bundle digest は manifest 全体のハッシュなので、dtype を変えれば bundle ID が変わる（§5.7 の要求どおり）。
+CPUは宣言に関わらず常に FP32（半精度CPU推論は速くも参照にもならないため）。
+
+#### D13. K4：テンプレートは精度で決められなかった（§5.3 に結果を反映）
+
+3案の比較で**二値36件中32件が一致**した。差は最大で1件、Score誤差で 0.021 であり、
+n=52 の自作 fixture ではノイズと区別できない。したがって採用は精度ではなく**構造的コスト**で決め、
+`nli-template-v1` を維持した。`nli-template-v3`（僅差で最良）を採らなかったのは、
+serializer に文字種判定が入り「英語の質問に日本語の文字が1つ混ざるだけで全候補の枠が切り替わる」
+不連続を恒久的に抱えるためである。判断の全文と不採用理由は POC_RESULTS 第3章。
+
+副産物として分かったこと：**Noul の誤答は3案でほぼ共通**しており、原因はテンプレートではなく
+既定の英文候補（`The answer to the question is yes. / no.`）と未校正のバックボーンにある可能性が高い。
+
+#### D14. K6：VRAM 共存は問題なし。ただし CUDA OOM 経路は実地未検証
+
+他プロセスが約6 GBを使用したまま、FP32（重み約2.2 GB）でロード・warmup・smoke 52件・
+ベンチ110リクエスト・実モデルテスト59件をすべて完走した。`max_batch_tokens` を下げる必要はなかった。
+**CUDA OOM の処理経路（文脈付きログ → `empty_cache()` → 例外 → 500）は実装済みだが、
+本環境では一度も発火していない。** 実地未検証として README N20 に記した。
+
+#### D15. D6（`count_and_encode` を event loop 上で呼ぶ）は撤回済みのままで正しかった
+
+フェーズ1.5（§12.2 P-1）で encode を専用スレッドへ移した判断は、実 tokenizer で裏付けられた。
+実測の compile+encode は Q=4・K=8 で約1.0 ms と軽いが、これは escape と token 化が
+**同一 premise を1回だけ**処理しているからである（`backends/base.py` の SHOULD）。
+32系列すべてで state を token 化していれば同じ仕事を32回していた。
+
+#### D16. 互換性優先（ADR-016）で変えた4点
+
+ユーザーの方針決定（「実ユースケースが未定の現段階では、Jev API との互換性が最も強く問われる」）に伴い、
+仕様書が v0.3.0 へ改訂された。本書の §4.2・§4.5・§6.5・§8.1・§8.3 を追従させたうえで、次を実装した。
+
+| # | 変えた点 | 理由と代償 |
+| --- | --- | --- |
+| 1 | **トップレベルの未知フィールドを既定で無視**する（`compat.unknown_top_level_fields: ignore`、`reject`で従来どおり422） | SDK の `extra_body` が将来のフィールドを送れるため、形式だけを理由に拒否しない。**代償：フィールド名の誤記に気付けない。** 付録Aのトップレベルを `additionalProperties: true` にし、PT03（schemaとvalidatorの一致）は既定の `ignore` で一致させた。`reject` は「公開schemaより狭い」方向なので、運用者が明示的に選んだときだけ起きる |
+| 2 | **422本文に `detail` 配列を併記** | SDK の wire schema（Jev の OpenAPI 由来）が 422 を `{"detail":[{"loc","msg","type"}]}` と定義するため、`detail` を直接読むクライアントが動く。`loc` は `["body"] + path`、質問の内部を指し型が判別できた場合のみ質問IDの直後に型tagを挿入。**`input`・`ctx` は付けない**（入力値の反射になる。§15.2）。`msg` は `error.message` と同値なので SDK の例外メッセージは変わらない（実ソケットで確認） |
+| 3 | **質問数上限 32 → 256** | Jev に件数上限の記載がない。実効上限は token 予算が決める。付録A・B の `maxProperties`、response schema、CT01 の境界（256/257）、capabilities を同期した |
+| 4 | **PoC設定で `jev-latest`・`jev-preview` を有効化** | SDK の既定 model が `jev-latest` であり、**接続先とAPI keyだけ差し替えて動く**ことがC2の実演になる。ソフトウェア既定は無効のまま。`response.model` は不変ID（D01） |
+
+`compat/differences.md` は互換性の観点で構成し直し、冒頭に
+**「Jev で通る要求が JevBERT で形式理由により拒否されうる箇所」（R1〜R12）**の一覧を置いた。
+
+#### D17. 設計に無かった追加
+
+- **`src/jevbert/fetch.py`**：§3.1 のモジュール構成にない。`fetch-model` の実装（固定revisionの取得、
+  safetensorsのみのallow-list、SHA-256のmanifestへの記録）を CLI から分離した。
+  記録済みhashは**上書きしない**。ローカルファイルが manifest と食い違う場合は
+  **再取得せずエラーで知らせる**（黙って直すと、hashが存在する理由そのものを潰すため）。
+- **`src/jevbert/evaluation/smoke.py` に `pipeline_answerer`**：smoke 評価をサーバー自身の
+  compile → encode → score → build 経路で走らせる。HTTPだけが無い。
+  smoke の数値が endpoint の返す値より良くなり得ないようにするため。
+- **capabilities のバグ修正**：`serializer_version` がテンプレートIDを含むようになった結果、
+  `manifest.serializer_version == SERIALIZER_VERSION` という比較が成立しなくなり
+  `"template": null` を公開していた。`template_id_of()` に置き換えた。
+
+#### D18. 残った懸念
+
+POC_RESULTS 第9章に記載した。要点は、Noul精度が低いこと（原因は既定候補文の可能性が高い）、
+CUDA OOM 経路が実地未検証であること、escape がモデル入力のテキストを変えること、
+**実 Jev との照合（G5）を一度も行っていないこと**、レイテンシーを1点しか測っていないこと。

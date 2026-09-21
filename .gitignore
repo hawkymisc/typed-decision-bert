@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# secrets / local env
+.env
+.env.*
+!.env.example
+
+# model weights (fetched by `python -m jevbert fetch-model`)
+models/
+
+# logs
+*.log
+logs/

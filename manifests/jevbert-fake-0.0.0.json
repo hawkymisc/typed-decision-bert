@@ -1,0 +1,29 @@
+{
+  "public_id": "jevbert-fake-0.0.0",
+  "description": "Deterministic fake bundle. Hashes its input instead of running a model; answers carry no meaning and must never be presented as model output.",
+  "release_date": "2026-09-21",
+  "backend": "fake-deterministic-v1",
+  "serializer_version": "serializer-nli-v1+nli-template-v1",
+  "source_model": null,
+  "calibration": {
+    "state": "uncalibrated",
+    "temperature": {
+      "noul": 1.0,
+      "choice": 1.0,
+      "score": 1.0
+    }
+  },
+  "confidence": "normalized-entropy-v1",
+  "usage_semantics": "expanded-input-a0-v1",
+  "dtype": "not-applicable",
+  "limits": {
+    "max_sequence_tokens": 2048,
+    "max_request_tokens": 131072
+  },
+  "validated": {
+    "languages": [],
+    "domains": [],
+    "max_choice_options": "unknown",
+    "quality": "unevaluated"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "public_id": "jevbert-poc-nli-ja-en-0.2.0",
+  "description": "P0.5 PoC bundle: a public zero-shot NLI classifier driven through the A0 candidate-per-sequence path (spec 7.7). Not a trained JevBERT model. Probabilities are uncalibrated and no quality gate has been run, so the answers must not be presented as evaluated judgements.",
+  "release_date": "2026-09-21",
+  "backend": "a0-nli-zeroshot-v2",
+  "serializer_version": "serializer-nli-v1+nli-template-v1",
+  "source_model": {
+    "repo": "MoritzLaurer/bge-m3-zeroshot-v2.0",
+    "revision": "9abf1c8aaeb82a2447809c20753ed0b106b76652",
+    "files": {
+      "config.json": "5449085fe904cdb0715398c7abf7fd049c3fc057e06353aa6a4701a6180ae4a1",
+      "model.safetensors": "142bc710004b7552bef46b36a2f749eeb0ca198db2608445841926f78202d12c",
+      "sentencepiece.bpe.model": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+      "special_tokens_map.json": "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835",
+      "tokenizer.json": "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790",
+      "tokenizer_config.json": "f90024142df07163e5e6c5b9a6ad7c8c68b22a9112af11e3db4559a9ff90f737"
+    }
+  },
+  "calibration": {
+    "state": "uncalibrated",
+    "temperature": {
+      "noul": 1.0,
+      "choice": 1.0,
+      "score": 1.0
+    }
+  },
+  "confidence": "normalized-entropy-v1",
+  "usage_semantics": "expanded-input-a0-v1",
+  "dtype": "float32",
+  "limits": {
+    "max_sequence_tokens": 2048,
+    "max_request_tokens": 131072
+  },
+  "model_max_sequence_tokens": 8192,
+  "validated": {
+    "languages": [],
+    "domains": [],
+    "max_choice_options": "unknown",
+    "quality": "unevaluated"
+  }
+}

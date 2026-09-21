@@ -4,9 +4,9 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 0.1.0 |
+| 文書バージョン | 0.3.0 |
 | 作成・公開資料確認日 | 2026-09-21（Asia/Tokyo） |
-| ステータス | 実装前の設計案。モデル学習、性能測定、実Jev APIとの互換性試験は未実施 |
+| ステータス | P0.5（PoC）実装に向けて詳細化した設計。モデル学習、校正、性能測定、実Jev APIとの互換性試験は未実施。PoCの実装設計は[docs/POC_DESIGN.md](docs/POC_DESIGN.md)を参照 |
 | プロジェクト名 | **JevBERT** |
 | Pythonパッケージ名案 | `jevbert`。配布レジストリ上の利用可否は未確認 |
 | 主な対象読者 | API実装者、機械学習エンジニア、評価・運用担当者 |
@@ -131,13 +131,33 @@ v0.1では、自由文生成、説明文生成、画像・音声入力、外部�
 
 | ID | 不一致・未確定点 | v0.1の決定と残す検証 |
 | --- | --- | --- |
-| U01 | HTTP referenceは`instructions`必須・非nullとしているが、Python SDKは省略・nullを許容。[S01](#source-s01)[S10](#source-s10) | SDK側に合わせ、省略・nullを受理して「追加指示なし」と扱う。実Jevへの送信結果は未確認 |
-| U02 | AdvancedはScore段階のnullを許容する一方、HTTP referenceとSDKのScore型は非null。[S01](#source-s01)[S06](#source-s06)[S10](#source-s10) | Score段階のnullは422で拒否する。差分fixtureを残す |
+| U01 | HTTP referenceは`instructions`必須・非nullとしているが、Python SDKは省略・nullを許容。[S01](#source-s01)[S10](#source-s10) | SDK側に合わせ、省略・nullを受理して「追加指示なし」と扱う。SDK 0.7.0は未設定の`instructions`・`criteria`をwireから**省略**する（nullは送らない）ことを実装で確認。[S18](#source-s18) 実Jevへの送信結果は未確認 |
+| U02 | AdvancedはScore段階のnullを許容する一方、HTTP referenceとSDKのScore型は非null。[S01](#source-s01)[S06](#source-s06)[S10](#source-s10) | Score段階のnullは422で拒否する。差分fixtureを残す。SDK 0.7.0の応答型`legend`もnull値を受理しないため、この決定はSDK復元とも整合する。[S18](#source-s18) |
 | U03 | HTTP referenceのScore `legend`は文字列mapだが、SDK応答型はobject・arrayも許容。[S01](#source-s01)[S11](#source-s11) | 元のrubricの型・値を保持して返す。勝手に文字列化しない。実API照合を残す |
-| U04 | エラー本文、未知フィールド、同率時の選択等は公開資料だけでは完全に確定しない | 第5章で独自挙動を固定し、実API照合まで「完全一致」としない |
+| U04 | エラー本文、未知フィールド、同率時の選択等は公開資料だけでは完全に確定しない | 第5章で独自挙動を固定し、実API照合まで「完全一致」としない。SDKがエラー本文から読む箇所は3.4節で確認済み |
 | U05 | `confidence`の具体式、token計数の完全な再現条件が未確認 | 数値互換対象から除外。独自の定義をversion管理する |
+| U06 | SDK docsのretry対象statusは`{408, 429, 500, 501, 502, 503, 504, 599}`だが、SDK 0.7.0実装の既定は`{408, 429, 500〜599の全て}`。[S18](#source-s18)[S20](#source-s20) | 実装を正とする。529・500も既定で最大2回再試行されることを前提に、サーバー側の副作用なし・冪等を保つ |
 
 **未知仕様を推測してJevの仕様として記述しない。** API、SDK、実際の動作に差がある場合は、それぞれの観測と採用判断を分けて記録する。
+
+### 3.4 公式Python SDK 0.7.0の実装から確認した事項
+
+2026-09-21にPyPI配布物`typesafe-sdk==0.7.0`のソースを読んで確認した。docsの記述ではなく**SDK実装の観測**であり、SDKの版が変われば再確認する。[S18](#source-s18)
+
+| 項目 | 観測 | JevBERTへの影響 |
+| --- | --- | --- |
+| URL結合 | `base_url.rstrip("/") + "/v1/systemone"`、`+ "/v1/models"` | `base_url`は`/v1`を含まないサーバールートを指定する。サーバーは`/v1/...`で待ち受ける |
+| 送信ヘッダー | `Authorization: Bearer <key>`、`Accept: application/json`、`Content-Type: application/json`、`User-Agent`・`X-TypeSafe-SDK`（`typesafe-sdk/<ver>`）、`X-TypeSafe-Runtime`、再試行時`X-TypeSafe-Retry-Count` | 未知の要求ヘッダーで拒否しない |
+| request ID | 応答ヘッダー`x-typesafe-request-id`を読む。無いと`response.request_id`が例外になる | 全応答（成功・エラー）に`x-typesafe-request-id`を付与する（5.7節） |
+| 未設定フィールド | `Noul`/`Choice`/`Score`オブジェクトの`None`フィールドはwireから省略。criteria内部のnullは保持 | 省略とnullの両方を受理する |
+| `extra_body` | トップレベルbodyへshallow merge。docsの例（`beam_width`）は説明用で、API referenceが定義するトップレベルは`state`・`model`・`questions`の3つだけ | 未知トップレベルフィールドは5.3節どおり既定で無視する |
+| 422本文 | SDKのwire schema（JevのOpenAPIから生成）は422を`{"detail":[{"loc":["body","questions","urgency","score","criteria"],"msg","type","input"?,"ctx"?}]}`と定義する。`loc`は`"body"`で始まり、質問IDの後に質問型のtagが入る | 422では`error`に加えて同じ外形の`detail`を併記する（5.9節） |
+| 応答の検証 | `extra="ignore"`、`strict=True`。`model`・`usage`・`answers`が対象。未知のanswer typeは無視 | 数値はJSON上もfloatとして出力する。余分なフィールドは無視されるが、I09により追加しない |
+| Scoreのキー | wireは文字列キー。SDKが`dict[int, ...]`へ変換 | wireでは`"0"`〜`"K-1"`の文字列キーを返す |
+| エラー本文 | `error`（文字列）→`error.message`→`message`→`detail`（文字列／`detail.message`／FastAPI形式の配列）の順でメッセージ抽出 | 5.9節の`{"error":{"code","message",...}}`形式で`error.message`が例外メッセージになる |
+| 例外の対応 | 400/401/403/404/422/429は専用例外。500以上（529含む）は`TypeSafeInternalServerError` | 529・503・504はSDKから同じ例外型に見える。`status`属性で区別する |
+| Retry既定 | `max_retries=2`、対象`{408, 429, 500〜599}`、`Retry-After`・`retry-after-ms`を尊重、全体予算30秒、既定timeout 10秒 | 504 deadline（30秒）より先にSDK側が10秒でtimeoutし得る。PoCではクライアント側timeoutの明示を推奨 |
+| models一覧 | `{"models":[{"name","description","release_date"}]}`。`release_date`は`YYYY-MM-DD`文字列 | 同じ外形で返す |
 
 ---
 
@@ -168,7 +188,7 @@ v0.1では、自由文生成、説明文生成、画像・音声入力、外部�
 | --- | --- | --- |
 | HTTP body | 展開後2 MiB | 413 |
 | JSON入れ子深さ | 32 | 422 |
-| 質問数 | 1〜32 | 422 |
+| 質問数 | 1〜256。Jevに質問数の上限の記載はなく（token上限のみ）、件数だけを理由にJevで通る要求を拒否しにくくするための値。実質的な上限はtoken予算が決める | 422 |
 | Choice候補数 | 2〜255 | 422 |
 | Score段階数 | 2〜10 | 422 |
 | 質問ごとの総token数 | 2,048以下。state・指示・全候補・制御tokenを含む | 422 |
@@ -223,7 +243,7 @@ Entry     = Content | null
 | `state` | Content | 必須 | 空文字列・空配列・空objectは構造上受理する |
 | `questions` | map<string, Question> | 必須 | 1件以上。キーは対応付けのみ。モデルに送らない |
 
-Questionは`type`で識別する。トップレベルとQuestionの未知フィールドは422で拒否する。stateや構造化説明の内部キーは業務データとして保持し、schemaの未知フィールド規則を適用しない。
+Questionは`type`で識別する。**トップレベルの未知フィールドは既定で無視する**（モデル入力にも応答にも使わない）。公式SDKは`extra_body`で将来のトップレベルフィールドを送る前方互換の仕組みを持ち、実Jevが未知フィールドをどう扱うかは公開資料から確定できないため、「Jevが受理し得る要求をJevBERTが形式だけを理由に拒否しない」ことを優先する（ADR-016）。設定`compat.unknown_top_level_fields: reject`で422に切り替えられる。Questionの未知フィールドは、質問の意味を変え得るフィールドを黙って無視しないため422で拒否する（公式SDKのQuestion型も未知フィールドを送れない）。stateや構造化説明の内部キーは業務データとして保持し、schemaの未知フィールド規則を適用しない。
 
 | 質問型 | `instructions` | `criteria` |
 | --- | --- | --- |
@@ -353,11 +373,15 @@ API出力を小数点2桁などに一律丸めない。表示用丸めとwire上
 
 ```text
 X-Request-ID: <server-generated-id>
+x-typesafe-request-id: <same-server-generated-id>
 X-JevBERT-Contract: jevbert-core-2026-09-21
 X-JevBERT-Confidence: normalized-entropy-v1
-X-JevBERT-Usage: expanded-input-v1
+X-JevBERT-Usage: <usage-semantics-id>
 X-JevBERT-Bundle: <immutable-bundle-digest>
+X-JevBERT-Calibration: calibrated | uncalibrated
 ```
+
+`x-typesafe-request-id`は公式SDKが`response.request_id`・例外の`request_id`として読む応答ヘッダーであり、SDK互換（C2）のために`X-Request-ID`と同じ値で付与する（3.4節）。request IDはサーバー生成とし、クライアント指定値を信頼して採用しない。エラー応答本文の`request_id`も同じ値とする。`X-JevBERT-Usage`はbackendの入力展開方式ごとのID（A1は`expanded-input-v1`、A0系は`expanded-input-a0-v1`）を返す（5.8節）。
 
 `GET /v1/models`では、登録・認可されたモデルだけを`models`配列に含める。`name`・`description`・`release_date`は実際のmanifestから取得する。本書作成日をモデルのリリース日として流用しない。[S09](#source-s09)
 
@@ -366,6 +390,8 @@ X-JevBERT-Bundle: <immutable-bundle-digest>
 ### 5.8 Usage
 
 `usage.input_tokens`は、質問ごとに組み立てたモデル入力の非padding token数の合計とする。特殊tokenを含む。同じstateをQ個の質問へ展開した場合はQ回分を数える。batch padding、再試行、サーバー内部の追加計算は含めない。
+
+上記はA1（1質問1系列）の定義`expanded-input-v1`である。A0系backend（候補ごとに1系列）では、`usage.input_tokens`を**全質問・全候補の系列の非padding token数の合計**とし、定義IDを`expanded-input-a0-v1`とする。同じ入力でもA1より大きな値になるため、backendの異なるbundle間で比較しない。4.2節の「質問ごとの総token数」はA0系では「1系列（state＋指示＋1候補）のtoken数」に、「リクエスト内総token数」は全系列の合計に適用し、実効値はbundleのmanifestとcapabilitiesで公開する。
 
 `usage.output_tokens = 0`とする。自己回帰出力tokenを生成していないためであり、レスポンスJSONをtokenizeした数ではない。この計数はJevの請求用token数の再現ではない。バックボーンやserializerが異なるモデル間の課金・コスト比較にそのまま使わない。
 
@@ -385,6 +411,12 @@ X-JevBERT-Bundle: <immutable-bundle-digest>
 | 500 | `inference_error` | NaN logits、不変条件違反、回復不能な内部異常 |
 
 公式referenceには401・422・429・529が記載されている。上表のエラー本文や追加statusはJevBERTの設計であり、Jevとの全文一致は未確認である。[S01](#source-s01)
+
+未定義のパスは404（`not_found`）、定義済みパスへの非対応メソッドは405（`method_not_allowed`）を同じエラー本文形式で返す。フレームワーク既定のエラー本文をそのまま露出させない。
+
+**422に限り、Jevのschemaと同じ`detail`配列を併記する。** 公式SDKのwire schemaはJevの422を`{"detail":[{"loc","msg","type"}]}`（`loc`は`["body", ...]`で始まる）と定義しており（3.4節）、`detail`を直接読む既存クライアントがそのまま動くようにするためである。`loc`は`["body"] + path`とし、pathが質問の内部を指す場合は質問IDの直後に質問型（`noul`・`choice`・`score`。型が判別できた場合のみ）を挿入する。`msg`は`error.message`と同じ、`type`は`error.code`と同じ値とする。`input`・`ctx`は入力値を反射しないため付けない。SDKのメッセージ抽出は`error.message`を優先するので、併記によって例外メッセージは変わらない。401・429・5xxのJev本文は公開資料・SDK schemaのどちらからも確定できないため、JevBERT形式のままとする。
+
+公式SDK 0.7.0は`error.message`を例外メッセージとして抽出し、408・429・500番台（529を含む）を既定で再試行する（3.4節）。`retryable`フィールドはJevBERT独自の補助情報で、SDKの再試行判定には使われない。推論は副作用を持たないため再試行は安全だが、`inference_error`（500）のような再試行しても回復しない失敗もSDK既定では再試行される点を差分として公開する。
 
 ```json
 {
@@ -466,12 +498,13 @@ chunking、retrieval、要約、階層分類は後続の明示的なpipeline機�
 | `answerdotai/ModernBERT-base` | 英語の速度・精度・実装比較用 | 英語・code中心のBERT系encoder。分類にはfine-tuningを要する。日本語品質を推定しない。[S13](#source-s13) |
 | ModernBERT-large系 | baseで不足した場合の容量比較 | 大きいモデルが業務効用でも優れるか実測して判断する |
 | Layaの公開チェックポイント | 近接する先行実装との比較用 | encoderとoption markerによる判定実装がある。採用するrevisionと用途を固定する。[S16](#source-s16) |
+| `MoritzLaurer/bge-m3-zeroshot-v2.0` | **P0.5（PoC）の暫定serving backend**。学習済みJevBERTが存在しない段階で、任意の指示・候補に意味のある分布を返すため | XLM-RoBERTa-large系（BGE-M3）の多言語zero-shot NLI分類器。2クラス（entailment / not_entailment）、MIT、safetensors、標準の`transformers`クラスでロードでき任意コード実行が不要。JevBERTの学習成果物ではなく、指示追従・校正・日本語品質は未評価。[S19](#source-s19) |
 
-v0.1の最終バックボーンは第14章のgateで決める。JevBERTという名前は特定のバックボーンを固定しない。classic BERTそのものに限定せず、BERT系encoder-only Transformerを対象とする。
+v0.1の最終バックボーンは第14章のgateで決める。P0.5のbackendはこの選定の対象外であり、学習済みbundleができた時点で置き換える（7.7節）。JevBERTという名前は特定のバックボーンを固定しない。classic BERTそのものに限定せず、BERT系encoder-only Transformerを対象とする。
 
 ### 7.2 A0：候補ごとのcross-encoderベースライン
 
-A0は学習・オフライン比較用とし、v0.1の公開推論backendはA1とする。A0では各候補について、state・指示・候補名・説明を入力し、共有scalar headでlogitを得る。
+A0は学習・オフライン比較用とし、v0.1の公開推論backendはA1とする。例外として、学習済みbundleが存在しないP0.5（PoC）に限り、A0派生のzero-shot NLI backendをservingに使う（7.7節）。A0では各候補について、state・指示・候補名・説明を入力し、共有scalar headでlogitを得る。
 
 $$
 z_{q,k}=f_\theta(s,i_q,c_{q,k},t_q)
@@ -529,6 +562,20 @@ A2はv0.1のクリティカルパスに入れず、Qの大きいワークロー�
 Layaは近接するencoder型のtyped-decision実装であり、simple-jevにもnative encoder backendとしての起動例がある。したがって「encoder-onlyであること」だけを新規性とは位置付けない。[S15](#source-s15)[S16](#source-s16)
 
 Layaのモデルカードには、typed-decisionsに対するベースモデルの限界、benchmark訓練分割でfine-tuningしたモデルとの違い、過信や候補数・token予算の制約が記載されている。著者の性能値は本プロジェクトで再現した値ではなく、JevBERTの性能根拠や学習法の正しさの保証には使わない。[S16](#source-s16)
+
+2026-09-21の追加調査では、Layaの利用には独自の`laya` pipパッケージが必要で、公式のソースリポジトリは確認できなかった。入力は`[CLS] 型 指示 [SEP] ([MASK] 候補)... [SEP] state [SEP]`の形で、各候補直前の`[MASK]`位置のhidden stateを2層Transformer head＋scalar scorerへ通す構成であり、A1と近い。一方、モデルカード自身がbase checkpointのzero-shot typed-decisions精度をほぼ偶然水準と記載し、日本語の評価値も確認できなかった。simple-jevにはLICENSEファイルがなく、コードの流用可否は未確定である。これらにより、Laya・simple-jevはP0.5のbackend・コード流用元には採用せず、比較対象としての位置づけを維持する（ADR-012）。
+
+### 7.7 P0.5：zero-shot NLI backend（PoC用のA0派生）
+
+学習済みJevBERT bundleが存在しない段階でAPIサーバーをend-to-endで成立させるため、A0（候補ごとのcross-encoder）の形を保ったまま、共有scalar headを**公開zero-shot NLI分類器のentailment log-odds**で代用するbackendを`a0-nli-zeroshot`系列として定義する。backend IDは入力の組み立て規則を含めて版管理し、現行は`a0-nli-zeroshot-v2`である（`v1`は予約文字列のescapeがASCIIの`<`だけを対象にしており、tokenizer内部の正規化で全角`＜s＞`等が制御tokenへ化けて500になった。`v2`はtokenizer自身の正規化後の文字列で判定する。`<`を含む入力で系列が変わるため、5.7節に従いbackend IDとbundle IDを上げた）。
+
+$$
+z_{q,k}=\log p_{\mathrm{ent}}(x_{q,k})-\log\bigl(1-p_{\mathrm{ent}}(x_{q,k})\bigr)
+$$
+
+ここで`x_{q,k}`は、premise＝正規化したstate、hypothesis＝指示と候補`k`から決定論的テンプレートで組み立てた文である。候補間の分布は第8章どおり質問内softmaxで得る。Noulは`false, true`の2候補、Scoreは段階ごとの候補として同じ経路を通す。
+
+これは7.2節が戒める「既存NLIのentailment確率を候補間softmaxへ流せば目的の分布になる」という仮定を**置かない**ための位置づけを要する。すなわち、このbackendの出力は構造・数値の不変条件（5.5節）は満たすが、確率としての校正は未実施（`uncalibrated`、T=1）であり、指示追従・Scoreの順序性・日本語品質はいずれも未評価である。capabilitiesとREADMEにその旨を明示し、G2・G3を通過したものとして扱わない。backendの内部契約（12.2節）は共通とし、学習済みA1 bundleへの置き換えでAPI層を変更しない。テンプレート・token予算・評価方法の詳細は[docs/POC_DESIGN.md](docs/POC_DESIGN.md)に置く。
 
 ---
 
@@ -803,11 +850,11 @@ Jevと同じ誤りをしたことを品質向上として扱わず、Jevと異�
 
 | 試験ID | 内容 | 期待結果 |
 | --- | --- | --- |
-| CT01 | 3型の単独・混在、1質問・32質問 | ID・型・件数・応答schemaが正しい |
+| CT01 | 3型の単独・混在、1質問・256質問・257質問 | ID・型・件数・応答schemaが正しい |
 | CT02 | string、array、nested objectのstate・instructions・criteria | 型と値を保持し、正常にcompileできる |
 | CT03 | Choiceのnull説明、Noulの片側criteria、null・省略instructions | 第5章どおりに処理 |
 | CT04 | 候補数の境界：Choice 1/2/255/256、Score 1/2/10/11 | 規定どおり受理・拒否 |
-| CT05 | 空questions、未知type、未知フィールド、NaN、重複キー | 規定の4xx。部分200を返さない |
+| CT05 | 空questions、未知type、Questionの未知フィールド、トップレベル未知フィールド（既定で無視・`reject`設定で422）、NaN、重複キー | 規定の4xx。部分200を返さない |
 | CT06 | token上限の直前・一致・超過、body上限、深さ上限 | 無断truncationなし |
 | CT07 | 同率、極端logit、一様logit、1候補以外がpadding | 正規化、tie-break、maskが正しい |
 | CT08 | all-masked、NaN logit、候補mapping欠落 | 500等で失敗し、架空の確率を返さない |
@@ -869,7 +916,7 @@ Jevとの比較指標は、Choice一致率、Noul絶対差、Scoreの正規化�
 
 固定版のPython SDKで、sync・async、`system_one`、`models.list`、型付きQuestion、辞書Question、応答復元、422・429・529での例外・retryを確認する。SDKがScoreのキーを整数へ変換する箇所も含め、HTTPの文字列キーと混同しない。[S04](#source-s04)[S11](#source-s11)[S12](#source-s12)
 
-`base_url`指定に対応していることは公式資料で確認できるが、JevBERTへ向けて実際に接続した成功は未確認である。[S12](#source-s12)
+`base_url`指定に対応していることは公式資料で確認できる。[S12](#source-s12) URL結合・ヘッダー・例外対応・retry既定はSDK 0.7.0の実装で確認した（3.4節）。JevBERTへ向けた実接続はP0.5のSDK試験で確認し、結果を`compat/differences.md`へ記録する。SDK試験は実サーバープロセス（実ソケット）に対して行い、少なくとも次を含める：`system_one`の3型混在の復元、`response.request_id`、`models.list`、Scoreのintキー復元、401→`TypeSafeAuthenticationError`、422→`TypeSafeUnprocessableEntityError`、5xx→`TypeSafeInternalServerError`、`AsyncTypeSafeClient`での同等の正常系。SDKの版は`typesafe-sdk==0.7.0`に固定する。
 
 ---
 
@@ -907,7 +954,7 @@ accuracy等の非劣性に加えて、稀少カテゴリのrecall、業務損失
 
 ### 14.3 性能測定
 
-初期ベンチマークは、Q=`1/4/16/32`、Choice K=`2/8/32/255`、系列長=`128/512/2048`、同時実行数=`1/8/32`を組み合わせる。token上限を超える組合せは推論速度測定から分離し、拒否処理として測る。
+初期ベンチマークは、Q=`1/4/16/32/256`、Choice K=`2/8/32/255`、系列長=`128/512/2048`、同時実行数=`1/8/32`を組み合わせる。token上限を超える組合せは推論速度測定から分離し、拒否処理として測る。
 
 CPUのFP32参照実装と、本番候補GPUの固定dtype・固定backendを別々に測る。tokenization、queue待ち、GPU実行、数値処理、serialization、end-to-endを分け、warm/cold、p50/p95/p99、requests/s、questions/s、peak memoryを記録する。
 
@@ -1101,7 +1148,7 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 
 ### 18.3 Alias
 
-`jev-latest`の受理は、既存コードの設定変更を少なくするための任意機能とする。既定は無効。有効化してもresponse.modelは実際のJevBERT IDとし、capabilitiesにaliasの対応を表示する。
+`jev-latest`の受理は、既存コードの設定変更を少なくするための任意機能とする。ソフトウェアの既定は無効。ただし公式SDKの既定modelは`jev-latest`であり、接続先とAPI keyの変更だけで動くこと（C2）を重視するP0.5のPoC設定では、`jev-latest`・`jev-preview`を明示的に有効化する。Jev自身のschemaも応答の`model`が要求のaliasと異なり得ると記載しており、不変IDを返す挙動はこれと矛盾しない。[S18](#source-s18)有効化してもresponse.modelは実際のJevBERT IDとし、capabilitiesにaliasの対応を表示する。
 
 未登録の`jev-*`をワイルドカードで何でも受理しない。Jevのバージョンを指定した利用者が同じモデルを実行したと誤認する挙動を避ける。
 
@@ -1114,6 +1161,7 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 | 段階 | 主な作業 | 成果物・終了条件 |
 | --- | --- | --- |
 | P0：契約固定 | schema、validator、固定logitのfake backend、SDK fixture、外部仕様の不一致整理 | 数値・構造試験が通り、ML未実装でも入出力を検証できる |
+| P0.5：PoCサーバー | P0の成果に、zero-shot NLI backend（7.7節）、model registry・manifest、SDK実接続試験、PoC品質smoke評価を加え、単一マシンで常駐させる | 個人PoC用途でJev互換APIがローカルで動作する。G0と、G1のうち正常系・主要異常系を通過。G2〜G5は未達として明示。非機能要件の充足・未充足をREADMEに記載 |
 | P1：学習ベースライン | pilotデータ、人手基準、A0/A1、少数例overfit、指示変更試験 | 学習・推論の対応が確認でき、少なくとも固定分類以上の追従性を測れる |
 | P2：限定業務版 | データ拡充、model選定、校正、policy-dev、locked-test | G0〜G4を通過した範囲だけを明示したpreview |
 | P3：移行検証 | 許可された実Jev比較、SDK結合、shadow、canary | G5通過。対象アプリでの置換条件を文書化 |
@@ -1139,6 +1187,12 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 | ADR-008 | supervised CEを最初に使用 | RLの導入前に指示条件付き分類と校正の基準を成立させる |
 | ADR-009 | 質問IDはモデルへ渡さない | 呼び出し側のID変更に依存しない契約を保つ |
 | ADR-010 | 新版ごとにbundle・policyを固定 | 校正やserializer変更による無言の挙動変更を防ぐ |
+| ADR-011 | P0.5のserving backendは公開zero-shot NLI分類器（`bge-m3-zeroshot-v2.0`）によるA0派生 | 学習データ・学習済みモデルがない状態でend-to-endを成立させる。標準`transformers`クラス・safetensors・MITで、任意コード実行が不要。代償：候補数に比例する計算、未校正、指示追従・日本語品質は未評価。fake backendのみ（意味のある回答を返さない）と、JevBERTの学習を先行させる案（データがなくPoCの完了条件に届かない）は不採用 |
+| ADR-012 | Laya・simple-jevをP0.5のbackend・コード流用元にしない | Layaは独自pipパッケージ経由でしかロードできず公式ソースが確認できない（15.3節のsupply chain方針と衝突）。モデルカード記載のzero-shot精度もほぼ偶然水準。simple-jevはLICENSE不在。比較対象としての位置づけは維持し、内部backend契約を共通にして後から追加可能にする |
+| ADR-013 | 応答に`x-typesafe-request-id`を付与 | 公式SDKの`request_id`復元に必要。互換本文は変えずヘッダーのみ追加 |
+| ADR-014 | モデル取得は明示的な取得スクリプトでrevision固定のうえ事前に行い、サーバーはoffline（`local_files_only`）でロード | `allow_remote_model_download: false`（17.2節）と15.3節を満たす。代償：初回セットアップが1手順増える |
+| ADR-016 | 互換性の優先順位：Jevが受理し得る要求を形式理由で拒否しない／Jevのエラー外形に寄せる | 実ユースケースが未定の段階では、JevBERTの価値はJev APIとの互換性で測られる。具体的には、(1) トップレベル未知フィールドを無視、(2) 422本文にJevのschemaと同じ`detail`配列を併記、(3) 質問数上限を256へ緩和、(4) PoC設定で`jev-latest`・`jev-preview` aliasを有効化。代償：未知フィールドの誤記に気付きにくくなる。token上限・`confidence`・`usage`など、モデルに由来して一致させられない差分は従来どおり差分として公開する |
+| ADR-015 | P0.5の認証は設定された静的Bearer keyの定数時間比較 | 個人PoCの単一利用者を想定。利用者別rate limit（429）・tenant分離は実装しない。未充足としてREADMEに明示 |
 
 ---
 
@@ -1158,6 +1212,10 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 | OPEN-06 | 高候補数と長文の品質 | 受理上限と検証済み品質範囲を別々に測る |
 | OPEN-07 | 名前・package・配布条件 | 公開前にregistry、依存・データの条件を確認 |
 | OPEN-08 | 本番ハードウェア・SLO・運用コスト | 固定環境の負荷試験と実稼働率で見積もる |
+| OPEN-09 | P0.5のNLI backendにおけるhypothesisテンプレートの妥当性、Noulの2候補softmaxとScoreの順序性の品質 | PoC品質smoke評価（日本語・英語の少数fixture）で傾向を記録する。統計的な品質主張はしない。学習済みA1 bundleで解消する |
+| OPEN-10 | simple-jevのライセンス、Layaの公式ソース・依存・日本語品質 | 比較対象として使う時点で再確認する |
+
+U01（SDKが未設定`instructions`を省略すること）、SDKのURL結合・request IDヘッダー・例外対応・retry既定は、SDK 0.7.0の実装観測により解決済み（3.4節）。実Jevサーバー側の挙動はOPEN-01のまま残る。
 
 ### 21.2 主要リスク
 
@@ -1200,6 +1258,9 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 | <a id="source-s15"></a>S15 | [featherless-ai/simple-jev](https://github.com/featherless-ai/simple-jev) | 独自API差分、Laya backendの存在 |
 | <a id="source-s16"></a>S16 | [Laya model card](https://huggingface.co/convaiinnovations/laya) | option-marker型実装、学習済みcheckpointの限界 |
 | <a id="source-s17"></a>S17 | [Guo et al., On Calibration of Modern Neural Networks](https://arxiv.org/abs/1706.04599) | Temperature scalingの参照 |
+| <a id="source-s18"></a>S18 | [typesafe-sdk 0.7.0（PyPI配布物のソース）](https://pypi.org/project/typesafe-sdk/0.7.0/)、[typesafe-sdk-python](https://github.com/typesafe-ai/typesafe-sdk-python) | URL結合、送信ヘッダー、request ID、wire serialize、応答検証、例外対応、retry既定。2026-09-21にwheelのソースを直接確認 |
+| <a id="source-s19"></a>S19 | [bge-m3-zeroshot-v2.0 model card](https://huggingface.co/MoritzLaurer/bge-m3-zeroshot-v2.0) | P0.5 backend。revision `9abf1c8aaeb82a2447809c20753ed0b106b76652`、`XLMRobertaForSequenceClassification`、`id2label = {0: entailment, 1: not_entailment}`、MIT |
+| <a id="source-s20"></a>S20 | [Python SDK: Exceptions](https://docs.typesafe.ai/sdk/python/api/exceptions)、[Retries](https://docs.typesafe.ai/sdk/python/api/retries)、[Changelog](https://docs.typesafe.ai/sdk/python/changelog) | 例外階層、RetryPolicy、0.6.0でのScore criteriaのSequence化、0.7.0でのpydantic化 |
 
 ---
 <a id="sec-23"></a>
@@ -1207,6 +1268,8 @@ base URLのroot・path結合、環境変数の優先順位、モデル一覧の�
 ## 23. 付録A：リクエストJSON Schema
 
 JSON Schema Draft 2020-12によるJevBERT側の構造契約である。第3章の公開資料の不一致については、第5章で決定した挙動を採用している。Jev公式schemaの転載ではない。
+
+トップレベルの`additionalProperties`は`true`である（未知のトップレベルフィールドは既定で無視する。5.3節、ADR-016）。`reject`設定時の422はruntime validatorが行う。Questionの未知フィールドは従来どおりschemaで拒否する。
 
 このschemaは最大の構造上限を表す。モデル登録、認可、bodyサイズ、入れ子深さ、token予算、実効モデル制限、重複JSONキー、非有限数値は別のvalidationで検証する。JSON parserに非有限数値や重複キーを許可した後でschemaだけに依存してはならない。
 
@@ -1216,7 +1279,7 @@ JSON Schema Draft 2020-12によるJevBERT側の構造契約である。第3章�
   "$id": "urn:jevbert:request:jevbert-core-2026-09-21",
   "title": "JevBERT SystemOne Request",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "model",
     "state",
@@ -1233,7 +1296,7 @@ JSON Schema Draft 2020-12によるJevBERT側の構造契約である。第3章�
     "questions": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 32,
+      "maxProperties": 256,
       "additionalProperties": {
         "$ref": "#/$defs/Question"
       }
@@ -1444,7 +1507,7 @@ JSON Schema Draft 2020-12によるJevBERT側の構造契約である。第3章�
     "answers": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 32,
+      "maxProperties": 256,
       "additionalProperties": {
         "$ref": "#/$defs/Answer"
       }
@@ -1719,7 +1782,7 @@ Noulには`probabilities_from_logits([false_logit, true_logit], T)[1]`を使う�
 | 入力 | 期待値 |
 | --- | --- |
 | Choice分布`[0.8, 0.15, 0.05]` | confidence ≈ `0.44214218356782187` |
-| Score分布`[0.1, 0.2, 0.7]` | score = `1.6`、confidence ≈ `0.27015330083790245` |
+| Score分布`[0.1, 0.2, 0.7]` | score ≈ `1.6`（数学的な値。上の参照実装の出力は倍精度の丸めにより`1.5999999999999999`で、1 ulp以内。§5.6の応答例の`1.6`も同様に表示上の値）、confidence ≈ `0.27015330083790245` |
 | 一様分布`[0.5, 0.5]` | confidence = `0.0` |
 | 集中分布`[0.0, 1.0]` | confidence = `1.0` |
 | 同率Choice `{"b":0.5,"a":0.5}` | 選択キー`"a"` |
@@ -1731,3 +1794,5 @@ Noulには`probabilities_from_logits([false_logit, true_logit], T)[1]`を使う�
 | 日付 | 版 | 内容 |
 | --- | --- | --- |
 | 2026-09-21 | 0.1.0 | JevBERTとして初版作成。互換範囲、モデル構成、学習、校正、評価、運用、移行、schema、数値参照実装を定義 |
+| 2026-09-21 | 0.2.0 | 公式SDK 0.7.0の実装観測を反映（3.3節U01・U02・U06、3.4節新設、5.7節`x-typesafe-request-id`・`X-JevBERT-Calibration`、5.9節404/405とSDK retry、13.7節SDK試験項目）。A0系のusage定義`expanded-input-a0-v1`を追加（5.8節）。P0.5（PoC）段階とzero-shot NLI backendを定義（7.1・7.2・7.7節、第19章）。Laya・simple-jevの追加調査結果と不採用理由を記録（7.6節、ADR-012）。ADR-011〜015、OPEN-09・10、S18〜S20を追加。PoCの実装設計を`docs/POC_DESIGN.md`へ分離 |
+| 2026-09-21 | 0.3.0 | P0.5 backendを`a0-nli-zeroshot-v2`へ更新（7.7節。全角の予約文字列で500になる欠陥の修正に伴う）。互換性優先の方針を明文化（ADR-016）：トップレベル未知フィールドを既定で無視（5.3節）、422本文へJev schemaと同形の`detail`を併記（3.4・5.9節）、質問数上限を32→256（4.2節、付録A・B、CT01）、PoC設定での`jev-latest`・`jev-preview` alias有効化（18.3節）。付録Cの検算値の注記を追加 |

@@ -1,0 +1,10 @@
+{"expected": true, "id": "noul-ja-refund-yes", "instructions": "顧客は返金を求めていますか。", "language": "ja", "state": "同じ利用料金が二重に引き落とされました。重複分を返金してください。", "type": "noul"}
+{"expected": false, "id": "noul-ja-refund-no", "instructions": "顧客は解約を求めていますか。", "language": "ja", "state": "同じ利用料金が二重に引き落とされました。重複分を返金してください。", "type": "noul"}
+{"expected": true, "id": "noul-ja-delivered-yes", "instructions": "顧客は商品を受け取りましたか。", "language": "ja", "state": "注文した商品は無事に届きました。中身も問題ありませんでした。", "type": "noul"}
+{"expected": false, "id": "noul-ja-delivered-no", "instructions": "顧客は商品の不具合を報告していますか。", "language": "ja", "state": "注文した商品は無事に届きました。中身も問題ありませんでした。", "type": "noul"}
+{"expected": true, "id": "noul-ja-booking-yes", "instructions": "顧客は予約日の変更を希望していますか。", "language": "ja", "state": "予約を来週の火曜日に変更したいのですが、キャンセル料はかかりますか。", "type": "noul"}
+{"expected": false, "id": "noul-ja-booking-no", "instructions": "顧客は予約の取り消しを求めていますか。", "language": "ja", "state": "予約を来週の火曜日に変更したいのですが、キャンセル料はかかりますか。", "type": "noul"}
+{"expected": true, "id": "noul-ja-crash-yes", "instructions": "顧客は技術的な不具合を報告していますか。", "language": "ja", "state": "アプリを開くたびに強制終了します。再インストールしても直りません。", "type": "noul"}
+{"expected": false, "id": "noul-ja-crash-no", "instructions": "顧客は請求内容について問い合わせていますか。", "language": "ja", "state": "アプリを開くたびに強制終了します。再インストールしても直りません。", "type": "noul"}
+{"expected": true, "id": "noul-ja-contact-yes", "instructions": "顧客はメールでの連絡を希望していますか。", "language": "ja", "state": "今回は電話ではなくメールでご連絡ください。", "type": "noul"}
+{"expected": false, "id": "noul-ja-contact-no", "instructions": "顧客は電話での連絡を希望していますか。", "language": "ja", "state": "今回は電話ではなくメールでご連絡ください。", "type": "noul"}

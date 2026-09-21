@@ -1,0 +1,57 @@
+# PoC configuration: the zero-shot NLI bundle (spec 7.7, ADR-011).
+#
+# `python -m jevbert fetch-model` must have downloaded the pinned revision into
+# `models/` and written the per-file SHA-256 values into the manifest before this
+# configuration can start (ADR-014). The server never downloads weights by itself, and
+# it refuses to start rather than serve weights the manifest does not vouch for.
+project: JevBERT
+contract_profile: jevbert-core-2026-09-21
+
+manifests_dir: ../manifests
+models_dir: ../models
+
+bundles:
+  - jevbert-poc-nli-ja-en-0.2.0.json
+
+# The fake backend answers with hashes of its input. It stays out of any configuration
+# that is meant to serve real answers.
+enable_fake_bundle: false
+
+limits:
+  max_body_bytes: 2097152
+  max_json_depth: 32
+  # spec 4.2 / ADR-016: Jev states no question-count ceiling, only a token budget.
+  max_questions: 256
+  min_choice_options: 2
+  max_choice_options: 255
+  min_score_levels: 2
+  max_score_levels: 10
+  # Per-sequence and per-request ceilings; the bundle manifest may narrow them further
+  # and its values are the ones published in capabilities (POC_DESIGN 5.5).
+  max_sequence_tokens: 2048
+  max_request_tokens: 131072
+  overflow_policy: reject
+
+serving:
+  host: 127.0.0.1        # Not exposed externally; there is no TLS (N21).
+  port: 8765
+  max_pending_requests: 8
+  request_deadline_seconds: 30.0
+  max_batch_tokens: 16384
+  max_batch_sequences: 64
+  result_cache_enabled: false
+  allow_remote_model_download: false
+  raw_request_logging: false
+  # spec 18.3: the software default is off, but this PoC configuration turns the two
+  # Jev names on, because the official SDK's default model is `jev-latest` and the
+  # point of C2 is that only the base URL and the API key have to change. The answer's
+  # `model` is still the immutable bundle ID (D01), never the alias.
+  allow_jev_aliases: true
+  aliases:
+    jev-latest: jevbert-poc-nli-ja-en-0.2.0
+    jev-preview: jevbert-poc-nli-ja-en-0.2.0
+
+# ADR-016: an unknown top level field is ignored so that a caller written against Jev
+# is not refused for its shape. Set to `reject` to get the strict reading back.
+compat:
+  unknown_top_level_fields: ignore

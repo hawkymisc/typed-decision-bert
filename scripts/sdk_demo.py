@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -217,87 +218,87 @@ def _raw_request(base_url: str, api_key: str, model: str | None) -> dict[str, An
     return response.json()
 
 
+#: The rubric the demo sends, which I07 requires the answer to give back unchanged.
+RUBRIC = [
+    "対応期限の指定がない",
+    "数日以内の対応を求めている",
+    "当日中または直ちに対応することを求めている",
+]
+
+
 def check_invariants(payload: dict[str, Any]) -> list[str]:
-    """I01-I09 of spec 5.5, reported one line each."""
-    answers = payload["answers"]
-    lines: list[str] = []
+    """I01-I09 of spec 5.5, reported one line each.
 
-    lines.append(_check("I01 question IDs round-trip", set(answers) == set(QUESTIONS)))
-    lines.append(
-        _check(
-            "I02 answer types match the questions",
-            answers["refund_requested"]["type"] == "noul"
-            and answers["department"]["type"] == "choice"
-            and answers["urgency"]["type"] == "score",
-        )
-    )
+    Every check is a callable rather than an eagerly evaluated expression: a body that
+    is missing an answer fails I01, and the checks after it would then raise a KeyError
+    and take the whole report with them. A broken body has to produce a report saying
+    which invariant broke, not a traceback (Q-M4).
+    """
+    answers = payload.get("answers", {})
 
-    numbers = list(_numbers(payload))
-    lines.append(
-        _check(
-            "I03 every number finite, probabilities and confidence in [0,1]",
-            all(value == value and abs(value) != float("inf") for value in numbers)
+    def numbers_are_finite() -> bool:
+        return (
+            all(value == value and abs(value) != float("inf") for value in _numbers(payload))
             and 0.0 <= answers["refund_requested"]["noul"] <= 1.0
             and all(
                 0.0 <= value <= 1.0
                 for key in ("department", "urgency")
                 for value in answers[key]["probabilities"].values()
             )
-            and all(0.0 <= answers[key]["confidence"] <= 1.0 for key in ("department", "urgency")),
+            and all(0.0 <= answers[key]["confidence"] <= 1.0 for key in ("department", "urgency"))
         )
-    )
-    lines.append(
+
+    def choice_is_the_argmax() -> bool:
+        probabilities = answers["department"]["probabilities"]
+        best = max(probabilities.values())
+        return probabilities[answers["department"]["choice"]] == best and answers["department"][
+            "choice"
+        ] == min(key for key, value in probabilities.items() if value == best)
+
+    def score_is_the_expected_value() -> bool:
+        levels = answers["urgency"]["probabilities"]
+        expected = sum(int(key) * value for key, value in levels.items())
+        return abs(answers["urgency"]["score"] - expected) <= 1e-6
+
+    return [
+        _check("I01 question IDs round-trip", lambda: set(answers) == set(QUESTIONS)),
+        _check(
+            "I02 answer types match the questions",
+            lambda: answers["refund_requested"]["type"] == "noul"
+            and answers["department"]["type"] == "choice"
+            and answers["urgency"]["type"] == "score",
+        ),
+        _check(
+            "I03 every number finite, probabilities and confidence in [0,1]",
+            numbers_are_finite,
+        ),
         _check(
             "I04 distributions sum to 1 within 1e-6",
-            all(
+            lambda: all(
                 abs(sum(answers[key]["probabilities"].values()) - 1.0) <= 1e-6
                 for key in ("department", "urgency")
             ),
-        )
-    )
-    probabilities = answers["department"]["probabilities"]
-    best = max(probabilities.values())
-    lines.append(
-        _check(
-            "I05 choice is the argmax (ties: smallest key)",
-            probabilities[answers["department"]["choice"]] == best
-            and answers["department"]["choice"]
-            == min(key for key, value in probabilities.items() if value == best),
-        )
-    )
-    levels = answers["urgency"]["probabilities"]
-    expected = sum(int(key) * value for key, value in levels.items())
-    lines.append(
-        _check(
-            "I06 score equals the expected value within 1e-6",
-            abs(answers["urgency"]["score"] - expected) <= 1e-6,
-        )
-    )
-    rubric = [
-        "対応期限の指定がない",
-        "数日以内の対応を求めている",
-        "当日中または直ちに対応することを求めている",
-    ]
-    lines.append(
+        ),
+        _check("I05 choice is the argmax (ties: smallest key)", choice_is_the_argmax),
+        _check("I06 score equals the expected value within 1e-6", score_is_the_expected_value),
         _check(
             "I07 legend preserves the rubric and its types",
-            answers["urgency"]["legend"] == {str(i): text for i, text in enumerate(rubric)},
-        )
-    )
-    lines.append(
-        _check("I08 no confidence on a Noul", "confidence" not in answers["refund_requested"])
-    )
-    lines.append(
+            lambda: answers["urgency"]["legend"]
+            == {str(index): text for index, text in enumerate(RUBRIC)},
+        ),
+        _check(
+            "I08 no confidence on a Noul",
+            lambda: "confidence" not in answers["refund_requested"],
+        ),
         _check(
             "I09 no unspecified fields",
-            set(payload) == {"model", "answers", "usage"}
+            lambda: set(payload) == {"model", "answers", "usage"}
             and set(answers["refund_requested"]) == {"type", "noul"}
             and set(answers["department"]) == {"type", "choice", "probabilities", "confidence"}
             and set(answers["urgency"])
             == {"type", "score", "legend", "probabilities", "confidence"},
-        )
-    )
-    return lines
+        ),
+    ]
 
 
 def _numbers(value: Any) -> Any:
@@ -313,7 +314,16 @@ def _numbers(value: Any) -> Any:
             yield from _numbers(item)
 
 
-def _check(label: str, ok: bool) -> str:
+def _check(label: str, predicate: Callable[[], bool]) -> str:
+    """One invariant, as a line. A check that cannot even run is a FAILED, named.
+
+    The exception is not swallowed: its class is in the line, and the line is what the
+    demo prints and what its exit code is computed from.
+    """
+    try:
+        ok = bool(predicate())
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        return f"{label:<58} FAILED ({type(exc).__name__})"
     return f"{label:<58} {'OK' if ok else 'FAILED'}"
 
 

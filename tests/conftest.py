@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,27 @@ def request_body(questions: dict[str, Any], state: Any = "顧客からの問い�
     return {"model": MODEL, "state": state, "questions": questions}
 
 
+#: Set to ``1`` to turn every ``model`` skip into a failure (Q-M2).
+REQUIRE_MODEL_ENV = "JEVBERT_REQUIRE_MODEL"
+
+
+def model_tests_are_required() -> bool:
+    return os.environ.get(REQUIRE_MODEL_ENV, "").strip() not in ("", "0", "false", "False")
+
+
+def _no_weights(reason: str) -> None:
+    """Skip, or fail when the run was told the weights must be there.
+
+    59 tests that skip in silence are 59 tests that look exactly like 59 that passed,
+    and the summary line says ``passed`` either way. A verification run sets
+    ``JEVBERT_REQUIRE_MODEL=1`` and gets a failure instead (Q-M2).
+    """
+    message = f"{reason} - run `uv run python -m jevbert fetch-model`"
+    if model_tests_are_required():
+        pytest.fail(f"{REQUIRE_MODEL_ENV} is set but the weights are not usable: {message}")
+    pytest.skip(message)
+
+
 def require_nli_weights() -> tuple[BundleManifest, str, Path]:
     """Skip unless the pinned weights are present and match the manifest.
 
@@ -110,18 +132,16 @@ def require_nli_weights() -> tuple[BundleManifest, str, Path]:
     unstated reason reads exactly like a model test that passed.
     """
     if not NLI_MANIFEST.is_file():
-        pytest.skip(f"{NLI_MANIFEST.name} is not in manifests/")
+        _no_weights(f"{NLI_MANIFEST.name} is not in manifests/")
     manifest, digest = read_manifest(NLI_MANIFEST)
     source = manifest.source_model
     if source is None or not source.files:
-        pytest.skip(f"{NLI_MANIFEST.name} records no source_model.files")
+        _no_weights(f"{NLI_MANIFEST.name} records no source_model.files")
+        raise AssertionError("unreachable")  # pragma: no cover - _no_weights never returns
     directory = model_directory(MODELS_DIR, source.repo)
     bad = mismatched_files(directory, source.files)
     if bad:
-        pytest.skip(
-            f"{len(bad)} model files are missing or stale under {directory} "
-            "- run `uv run python -m jevbert fetch-model`"
-        )
+        _no_weights(f"{len(bad)} model files are missing or stale under {directory}")
     return manifest, digest, directory
 
 

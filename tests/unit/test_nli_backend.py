@@ -13,14 +13,21 @@ is therefore an argument here: these tests drive the algorithm with a small stan
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 import torch
 from hypothesis import given
 from hypothesis import strategies as st
 
+from jevbert.backends.base import CancelToken, EncodedSequence
 from jevbert.backends.nli import (
     COMPUTE_DTYPES,
     RESERVED_STRINGS,
+    NliZeroShotBackend,
     escape_every_angle,
     escape_reserved,
     misplaced_control_token,
@@ -229,6 +236,95 @@ class TestReservedStringsForTokenizer:
     def test_a_tokenizer_without_special_tokens_refuses_to_load(self) -> None:
         with pytest.raises(ValueError, match="special token"):
             reserved_strings_for(self._Tokenizer([]))
+
+
+class _SumOfIdsModel:
+    """A stand-in for the weights: the logit of a sequence is the sum of its IDs.
+
+    That makes every sequence's score a fingerprint of the sequence, which is what a
+    test of "the results came back on the right rows" needs. Padding contributes
+    nothing, so a sequence scores the same whatever it is batched with.
+    """
+
+    def __call__(self, *, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Any:
+        totals = (input_ids * attention_mask).sum(dim=1).to(torch.float32)
+        logits = torch.stack([totals, torch.zeros_like(totals)], dim=1)
+        return SimpleNamespace(logits=logits)
+
+
+class _StubbedBackend(NliZeroShotBackend):
+    """The real ``score`` - microbatching, ordering, the finiteness check - on a stub."""
+
+    def __init__(self, *, max_batch_tokens: int, max_batch_sequences: int) -> None:
+        super().__init__(
+            Path("no-weights-here"),
+            max_batch_tokens=max_batch_tokens,
+            max_batch_sequences=max_batch_sequences,
+            device="cpu",
+        )
+        self._model = _SumOfIdsModel()
+        self._device = torch.device("cpu")
+
+
+class TestScoresComeBackOnTheRightSequences:
+    """Q-M1: the restoration of the original order was untested.
+
+    ``plan_microbatches`` sorts by length, so the dispatch order is not the request
+    order whenever the sequences differ in length. Deleting the restoration used to
+    break nothing that fails fast: only the statistical smoke evaluation noticed, and
+    only when it happened to cross a floor.
+    """
+
+    def _sequences(self, lengths: Sequence[int]) -> list[EncodedSequence]:
+        # Distinct IDs per sequence, so the sum identifies which one came back.
+        sequences = []
+        for index, length in enumerate(lengths):
+            ids = [1000 * (index + 1)] + [1] * (length - 1)
+            sequences.append(EncodedSequence(token_count=length, data=ids))
+        return sequences
+
+    def _expected(self, sequences: Sequence[EncodedSequence]) -> list[float]:
+        return [float(sum(sequence.data)) for sequence in sequences]
+
+    def test_mixed_lengths_across_several_batches_keep_their_places(self) -> None:
+        lengths = [9, 2, 7, 1, 5, 3, 8, 4]
+        backend = _StubbedBackend(max_batch_tokens=10_000, max_batch_sequences=2)
+        sequences = self._sequences(lengths)
+        assert backend.score(sequences, CancelToken()) == self._expected(sequences)
+
+    def test_the_work_really_was_split(self) -> None:
+        # The property above is vacuous if everything fitted in one batch.
+        batches = plan_microbatches(
+            [9, 2, 7, 1, 5, 3, 8, 4], max_batch_tokens=10_000, max_batch_sequences=2
+        )
+        assert len(batches) == 4
+        assert [index for batch in batches for index, _ in batch] != list(range(8))
+
+    def test_one_batch_per_sequence_still_keeps_the_order(self) -> None:
+        lengths = [4, 1, 3, 2]
+        backend = _StubbedBackend(max_batch_tokens=4, max_batch_sequences=1)
+        sequences = self._sequences(lengths)
+        assert backend.score(sequences, CancelToken()) == self._expected(sequences)
+
+    def test_equal_lengths_are_unaffected(self) -> None:
+        lengths = [3, 3, 3, 3, 3]
+        backend = _StubbedBackend(max_batch_tokens=10_000, max_batch_sequences=2)
+        sequences = self._sequences(lengths)
+        assert backend.score(sequences, CancelToken()) == self._expected(sequences)
+
+    def test_padding_does_not_change_a_score(self) -> None:
+        # A sequence batched with a much longer one is padded; the attention mask has
+        # to keep that padding out of the result.
+        backend = _StubbedBackend(max_batch_tokens=10_000, max_batch_sequences=8)
+        short = self._sequences([2])
+        together = backend.score(self._sequences([2, 40]), CancelToken())
+        assert together[0] == backend.score(short, CancelToken())[0]
+
+    def test_a_non_finite_logit_is_refused(self) -> None:
+        backend = _StubbedBackend(max_batch_tokens=10_000, max_batch_sequences=8)
+        sequences = [EncodedSequence(token_count=1, data=[float("nan")])]
+        with pytest.raises((ValueError, RuntimeError)):
+            backend.score(sequences, CancelToken())
 
 
 class TestPlanMicrobatches:

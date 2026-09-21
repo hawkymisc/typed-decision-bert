@@ -25,6 +25,7 @@ from jevbert.backends.nli import (
     escape_reserved,
     misplaced_control_token,
     normalizer_of,
+    plan_microbatches,
 )
 from jevbert.config import Limits, ServingSettings, Settings
 from jevbert.inference.registry import Bundle, ModelRegistry
@@ -446,12 +447,29 @@ class TestScoring:
         assert entailed > contradicted
 
     def test_scoring_is_repeatable(self, nli_backend: NliZeroShotBackend) -> None:
+        # Q-L: the same tolerance spec 13.3 gives a same-device FP32 comparison. Exact
+        # bit equality is a stronger claim than anything downstream relies on, and a
+        # cuBLAS or kernel-selection change would break it without changing an answer.
         sequences = nli_backend.count_and_encode(
             [TextPair("同じ state", f"候補 {index}") for index in range(8)]
         )
         first = nli_backend.score(sequences, CancelToken())
         second = nli_backend.score(sequences, CancelToken())
-        assert first == second
+        for one, two in zip(first, second, strict=True):
+            assert abs(one - two) <= 1e-6
+
+    #: Candidates whose token counts differ enough that ``plan_microbatches`` reorders
+    #: them. With equal lengths the sort is the identity and the restoration of the
+    #: original order is never exercised (Q-M1).
+    UNEVEN_CANDIDATES = [
+        "短い",
+        "やや長めの候補テキストで、token 数を意図的に増やしてあります。",
+        "中くらいの候補",
+        "きわめて長い候補テキストであり、他のどの候補よりも多くの token を占めるように、"
+        "同じ趣旨の説明を繰り返し書き足したものです。返金、請求、支払い、解約、いずれにも触れます。",
+        "a",
+        "medium length candidate text",
+    ]
 
     def test_the_batch_shape_does_not_move_the_answer(
         self, nli_backend: NliZeroShotBackend
@@ -463,7 +481,10 @@ class TestScoring:
         magnitude looser, because a distribution can absorb a logit shift that a caller
         reading raw scores would not.
         """
-        pairs = [TextPair("同じ利用料金が二重に引き落とされました。", f"候補{i}") for i in range(6)]
+        pairs = [
+            TextPair("同じ利用料金が二重に引き落とされました。", candidate)
+            for candidate in self.UNEVEN_CANDIDATES
+        ]
         sequences = nli_backend.count_and_encode(pairs)
         together = nli_backend.score(sequences, CancelToken())
         one_at_a_time = [
@@ -475,6 +496,43 @@ class TestScoring:
         single_p = probabilities_from_logits(one_at_a_time, 1.0)
         for first, second in zip(batched_p, single_p, strict=True):
             assert abs(first - second) <= BATCH_SHAPE_TOLERANCE
+
+    def test_several_microbatches_return_the_answers_in_request_order(
+        self, nli_backend: NliZeroShotBackend
+    ) -> None:
+        """Q-M1: with two sequences per batch the dispatch order is not the request one.
+
+        The candidates differ in length, so sorting by length permutes them and the
+        result has to be put back. The previous version of this check used candidates
+        of identical length in a single batch, where the permutation is the identity.
+        """
+        manifest, _, directory = require_nli_weights()
+        source = manifest.source_model
+        assert source is not None
+        split = NliZeroShotBackend(
+            directory,
+            max_batch_sequences=2,
+            device="cpu",
+            expected_file_hashes=source.files,
+        )
+        split.load()
+        pairs = [
+            TextPair("同じ利用料金が二重に引き落とされました。", candidate)
+            for candidate in self.UNEVEN_CANDIDATES
+        ]
+        sequences = split.count_and_encode(pairs)
+        lengths = [sequence.token_count for sequence in sequences]
+        assert len(set(lengths)) > 1, "the candidates have to differ in length"
+        batches = plan_microbatches(
+            lengths, max_batch_tokens=16_384, max_batch_sequences=2
+        )
+        assert len(batches) > 1
+        assert [index for batch in batches for index, _ in batch] != list(range(len(pairs)))
+
+        together = split.score(sequences, CancelToken())
+        alone = [split.score([sequence], CancelToken())[0] for sequence in sequences]
+        for batched, single in zip(together, alone, strict=True):
+            assert abs(batched - single) <= 1e-4
 
     def test_an_already_cancelled_token_stops_the_work(
         self, nli_backend: NliZeroShotBackend

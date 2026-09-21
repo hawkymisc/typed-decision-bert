@@ -64,6 +64,62 @@ def build_body(model: str) -> dict[str, Any]:
     }
 
 
+def build_premise_probe(model: str) -> dict[str, Any]:
+    """A request whose two candidates are empty, so ``usage`` measures the state alone.
+
+    Both Noul criteria render to the empty string and there are no instructions, so
+    each sequence is ``[bos] + premise + [eos, eos] + [eos]``: exactly ``P + 4`` tokens.
+    """
+    return {
+        "model": model,
+        "state": STATE,
+        "questions": {"probe": {"type": "noul", "criteria": {"true": "", "false": ""}}},
+    }
+
+
+def premise_sequence_tokens(probe_tokens: int) -> int:
+    """``P + 4`` from the probe's two identical sequences."""
+    if probe_tokens <= 0 or probe_tokens % 2:
+        raise ValueError(
+            f"the probe should report an even, positive token count, got {probe_tokens}"
+        )
+    return probe_tokens // 2
+
+
+def longest_sequence_upper_bound(
+    total_tokens: int, questions: int, options: int, premise_cost: int
+) -> int:
+    """An upper bound on the longest single sequence in the benchmark request.
+
+    ``usage.input_tokens`` is a *sum*, and the check used to divide it by the number of
+    sequences, which gives the mean. The benchmark point of spec 14.3 is stated per
+    sequence, and a mean under 512 says nothing about the longest one (Q-M4).
+
+    Every sequence here carries the same premise and differs only in its candidate, so
+    with ``C`` for the candidate token counts::
+
+        per_question = options x premise_cost + sum(C)
+        longest      = premise_cost + max(C)  <=  premise_cost + sum(C)
+
+    The bound needs one extra request rather than a tokenizer in this process, and a
+    bound that holds is what the condition asks for - not an average that does not.
+    """
+    if questions <= 0 or options <= 0:
+        raise ValueError("the benchmark point has at least one question and one option")
+    if total_tokens % questions:
+        raise ValueError(
+            f"{total_tokens} tokens do not divide evenly over {questions} identical questions"
+        )
+    per_question = total_tokens // questions
+    candidate_tokens = per_question - options * premise_cost
+    if candidate_tokens < 0:
+        raise ValueError(
+            f"the premise probe reported {premise_cost} tokens per sequence, which is more "
+            f"than the {per_question} the whole question costs"
+        )
+    return premise_cost + candidate_tokens
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="measure end-to-end latency (spec 14.3)")
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
@@ -89,20 +145,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"/readyz -> {ready.status_code}; the bundle is not ready.", file=sys.stderr)
             return 3
 
+        probe = client.post(
+            "/v1/systemone",
+            content=json.dumps(build_premise_probe(args.model), ensure_ascii=False).encode(),
+            headers=headers,
+        )
+        probe.raise_for_status()
+        premise_cost = premise_sequence_tokens(probe.json()["usage"]["input_tokens"])
+
         first = client.post("/v1/systemone", content=body, headers=headers)
         first.raise_for_status()
         payload = first.json()
         sequences = QUESTION_COUNT * OPTION_COUNT
-        per_sequence = payload["usage"]["input_tokens"] / sequences
+        total_tokens = payload["usage"]["input_tokens"]
+        longest = longest_sequence_upper_bound(
+            total_tokens, QUESTION_COUNT, OPTION_COUNT, premise_cost
+        )
         print(f"warm: {args.warmup} requests; measuring {args.iterations}, concurrency 1")
         print(
             f"Q={QUESTION_COUNT} K={OPTION_COUNT} -> {sequences} sequences per request, "
-            f"{payload['usage']['input_tokens']} input tokens "
-            f"({per_sequence:.0f} per sequence, limit {MAX_SEQUENCE_TOKENS})"
+            f"{total_tokens} input tokens ({total_tokens / sequences:.0f} per sequence on "
+            f"average, longest at most {longest}, limit {MAX_SEQUENCE_TOKENS})"
         )
-        if per_sequence > MAX_SEQUENCE_TOKENS:
+        if longest > MAX_SEQUENCE_TOKENS:
             print(
-                f"the benchmark point requires <= {MAX_SEQUENCE_TOKENS} tokens per sequence",
+                f"the benchmark point requires <= {MAX_SEQUENCE_TOKENS} tokens in the "
+                f"longest sequence; the bound is {longest}",
                 file=sys.stderr,
             )
             return 4
@@ -123,7 +191,8 @@ def main(argv: list[str] | None = None) -> int:
         "questions": QUESTION_COUNT,
         "options": OPTION_COUNT,
         "sequences_per_request": sequences,
-        "input_tokens": payload["usage"]["input_tokens"],
+        "input_tokens": total_tokens,
+        "longest_sequence_tokens_at_most": longest,
         "p50_ms": _percentile(samples, 50),
         "p95_ms": _percentile(samples, 95),
         "p99_ms": _percentile(samples, 99),

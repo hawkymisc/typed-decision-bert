@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 0.3.0（2026-09-21。フェーズ2の実測と互換性優先（ADR-016）を§12.3に反映し、本文の該当箇所を追従させた） |
+| 文書バージョン | 0.4.0（2026-09-21。フェーズ2.5のレビュー指摘の反映を§12.4に追記し、§5.4・§6.1・§6.3・§8.3を追従させた） |
 | 上位文書 | [JevBERT 仕様・設計書 v0.3.0](../JevBERT_spec_design.md)（以下「仕様書」。`§5.3`のように節を参照する） |
 | 目的 | 個人PoC用途で、Jev互換APIサーバーをこのマシン上で動作させる |
 | ステータス | 実装前に固定した設計（基準線）。実装・検証で判明した差分は第12章に追記する。**実測値は[docs/POC_RESULTS.md](POC_RESULTS.md)** |
@@ -112,7 +112,7 @@ src/jevbert/
   backends/
     base.py                # Backend Protocol（§12.2）
     fake.py                # fake-deterministic-v1
-    nli.py                 # a0-nli-zeroshot-v1
+    nli.py                 # a0-nli-zeroshot-v2
   inference/
     registry.py            # manifest、bundle digest、alias
     engine.py              # queue、worker、deadline、microbatch
@@ -191,9 +191,9 @@ boolean・number・stringの間の暗黙変換はしない。整数はPython `in
   "contract": "jevbert-core-2026-09-21",
   "stage": "P0.5-poc",
   "bundles": [{
-    "id": "jevbert-poc-nli-ja-en-0.1.0",
+    "id": "jevbert-poc-nli-ja-en-0.2.0",
     "digest": "sha256:…",
-    "backend": "a0-nli-zeroshot-v1",
+    "backend": "a0-nli-zeroshot-v2",
     "serializer": "serializer-nli-v1",
     "source_model": {"repo": "MoritzLaurer/bge-m3-zeroshot-v2.0", "revision": "9abf1c8a…"},
     "calibration": {"state": "uncalibrated", "temperature": {"noul": 1.0, "choice": 1.0, "score": 1.0}},
@@ -265,14 +265,24 @@ premiseとhypothesisは**別々に**`add_special_tokens=False`でtoken化する�
 [bos] + premise_ids + [eos, eos] + hypothesis_ids + [eos]      # XLM-RoBERTaのpair形式
 ```
 
-**`split_special_tokens=True`は実測で効かなかった**（K2。制御token IDが6個データ中に残った。§12.3、POC_RESULTS §5.2）。代替として、token化の直前に**予約文字列（`</s>` `<s>` `<pad>` `<unk>` `<mask>`）の1文字目`<`の直後へ空白を1つ挿入する**escapeをpremiseとhypothesisの両方に適用する（`"a<s>b"` → `"a< s>b"`）。大文字（`<S>`等）はtokenizerが特殊tokenとして照合しないためescapeしない。
+**`split_special_tokens=True`は実測で効かなかった**（K2。制御token IDが6個データ中に残った。§12.3、POC_RESULTS §5.2）。代替としてescapeを採るが、**判定はtokenizer自身のnormalizerを通した後の文字列に対して行う**（§12.4 S-H1）。tokenizerは特殊tokenを照合する**前に**precompiled charsmapで正規化するため、生のASCIIだけを見るescapeは全角・互換形で迂回される。
 
-これにより、ユーザーデータ中の`</s>`・`<s>`・`<mask>`・`<pad>`等が制御tokenとして解釈されない。**系列中の制御token IDの個数が常にちょうど4であること**をbackend内部でassertし、違反は例外にする（CT11）。ここで数える制御tokenに`<unk>`は含めない：語彙にない文字を表すデータtokenであり、数えると珍しいが正当な入力が500になるためである。escapeによってモデルが読むテキストが元の入力と一致しなくなる点は`compat/differences.md` L08に記録した。
+規則（`backends/nli.py`）:
+
+1. `normalize(text)` に予約文字列（`</s>` `<s>` `<pad>` `<unk>` `<mask>`）が1つも現れなければ、**テキストを1文字も変えない**。
+2. 現れたら、**正規化すると`<`になる文字すべて**（このcheckpointでは`<` U+003C・`﹤` U+FE64・`＜` U+FF1C の3文字。全Unicodeを走査して確定し、テストで固定している）の直後に空白を1つ入れる。`"a<s>b"` → `"a< s>b"`、`"＜/s＞"` → `"＜ /s＞"`。
+
+予約文字列はどれも`<`の直後が非空白なので、正規化後の全ての`<`の直後が空白になれば予約文字列は成立しない。大文字（`<S>`等）はtokenizerが特殊tokenとして照合しないためescapeしない。
+
+**最後の防壁は個数ではなく位置**である。系列は `[bos] premise [eos,eos] hypothesis [eos]` であり、4つの制御IDの位置はこのbackendが決めている。個数4だけを数えると「区切りがデータ側へ移り、利用者のtokenがその位置に入った系列」を通してしまう。位置検査に違反したpairは、**より強いescape**（正規化後のテキストに対し`<`の直後へ一律空白）で再token化し、それでも違反するときだけ例外にする（CT11）。利用者が書いたテキストが500の原因になってはならない。
+
+制御tokenに`<unk>`は含めない：語彙にない文字を表すデータtokenであり、数えると珍しいが正当な入力が500になるためである。ただし**リテラルの`<unk>`・`＜unk＞`はescapeの対象**である（利用者が書いた文字列が`<unk>`のIDになるのは、本物の未知文字とは別の事象なので分ける）。escapeによってモデルが読むテキストが変わる範囲は`compat/differences.md` L08・L09に記録した。
 
 ### 5.5 token予算
 
 - 1系列（1候補）のtoken数 ≦ `max_sequence_tokens`（PoC既定2,048。モデル上限8,192を超える設定は起動時に拒否。manifestの`model_max_sequence_tokens`との突合で実装する。§12.2 P-5）
 - リクエスト内の全系列の合計 ≦ `max_request_tokens`（PoC既定131,072。§4.2の32,768はA1の1質問1系列を前提とした値であり、候補ごとにstateを繰り返すA0系では同じ値だと実用的な質問数・候補数を受理できないため、PoC bundleの実効値として別に定める。capabilitiesで公開する）
+- **tokenizeの前**に**系列数**の上限を適用する。1系列は制御token4個＋データ1個を下回れないので、系列数が `max_request_tokens ÷ 5` を超えるリクエストは合計token上限を満たしようがない。件数だけで決まるため、token化する前に422 `context_length_exceeded` にする（§12.4 S-L1）。
 - **tokenizeの前**に文字数の上限 `max_request_chars`（既定 `4 × max_request_tokens`）を適用する。展開後の文字数合計＝`(premise長 + instructions長) × 候補数 + Σ候補長` を質問ごとに積み上げ、超過で422 `context_length_exceeded`。長さの算術だけで判定し、巨大な文字列を組み立てない（§12.2 P-1）。capabilitiesで公開する
 - manifestの上限が設定の上限を**上回る**ことは許さない（下回る＝絞り込むのは可）。上回る設定は起動時に拒否する（§12.2 P-5）
 - 超過は422 `context_length_exceeded`。**切り詰めない**（`truncation=False`）。`path`は該当質問まで。
@@ -295,7 +305,7 @@ class Backend(Protocol):
 
 backendは確率・confidenceを決めない（§12.1）。logit→確率は`scoring`だけが行う。
 
-`count_and_encode`は engine の encoder スレッド（単一）から呼ばれる。A0系では1リクエストの全pairが**同一のpremise**を持つ（最大 32×255＝8,160 個）ため、**同一呼び出し内で同一premiseのtoken化は1回だけ行うべき（SHOULD）**。キャッシュは呼び出しを越えて保持しない（§15.2）。
+`count_and_encode`は engine の encoder スレッド（単一）から呼ばれる。A0系では1リクエストの全pairが**同一のpremise**を持つ（最大 256×255＝65,280 個）ため、**同一呼び出し内で同一premiseのtoken化は1回だけ行うべき（SHOULD）**。キャッシュは呼び出しを越えて保持しない（§15.2）。
 
 backendの生成は factory に `BackendContext`（`models_dir`・`max_batch_tokens`・`max_batch_sequences`・`device`）を渡す形にする（§12.2 P-4）。
 
@@ -303,7 +313,7 @@ backendの生成は factory に `BackendContext`（`models_dir`・`max_batch_tok
 
 logit＝`sha256(premise ‖ 0x1f ‖ hypothesis)`の先頭8バイトを`[-4, 4]`へ線形写像した値。質問ID・順序に依存しないので、不変性テスト（§13.3）がcompilerの欠陥を検出できる。token数は「UTF-8バイト数＋4」で代用する。テスト用に`logit_fn`をコンストラクタで差し替え可能にし、同率・極端値・NaN・個数不一致を注入する（API経由では注入できない）。fake bundleは設定で明示的に有効化したときだけ登録する（既定は無効）。
 
-### 6.3 `a0-nli-zeroshot-v1`
+### 6.3 `a0-nli-zeroshot-v2`
 
 - モデル：`MoritzLaurer/bge-m3-zeroshot-v2.0` @ `9abf1c8aaeb82a2447809c20753ed0b106b76652`、`AutoModelForSequenceClassification`、`trust_remote_code=False`、`local_files_only=True`、safetensorsのみ。
 - entailmentのindexは`config.id2label`から名前で解決し、`entailment`が見つからなければロード失敗とする（index 0を決め打ちしない）。
@@ -388,6 +398,8 @@ TDDで進める：仕様（仕様書＋本書）からテストを先に書き�
 
 uvicornを別スレッドまたは別プロセスで空きポートに起動し、`TypeSafeClient`・`AsyncTypeSafeClient`（0.7.0）で確認する項目は仕様書§13.7のとおり。加えて、`Noul(criteria={"true": ...})`の片側指定、`Score`の構造化criteriaと`legend`の型保持、**`extra_body`で未知トップレベルフィールドを送ると既定では200で無視され`reject`設定では422になること**、**modelを指定しない（SDK既定の`jev-latest`）呼び出しがaliasで解決すること**、**422本文の`detail`配列をSDK経由で読めること（`loc[0] == "body"`）と、その併記が例外メッセージを変えないこと**、429・5xxでのSDK再試行を止めるため試験では`RetryPolicy(max_retries=0)`を指定することを含める。
 
+**429（rate limit）に対するSDKの挙動は試験していない。** N18（利用者別rate limit）を実装しておらず、`RateLimitExceededError`はどこからも送出されないため、SDKが429をどう再試行し・どう例外へ復元するかを観測する手段がない。これはCT12（別tenantの混在batch）を「並行リクエストの回答が混ざらないこと」に縮小したのと同種の**縮小**であり、達成ではない。N18を実装した時点で試験対象に入れる。
+
 ### 8.4 実モデルintegrationとsmoke評価
 
 - 実モデル・実GPUで、§5.6の例を送りI01〜I09を満たすこと、同一入力の再実行で分布が許容誤差（§13.3の`1e-3`）内であること、CT11の特殊token個数を確認する。
@@ -404,7 +416,9 @@ uvicornを別スレッドまたは別プロセスで空きポートに起動し�
 
 READMEでは各項目を**充足／部分充足／未充足**に分類し、根拠（テスト名・計測値・未実装理由）を添える。下表の「見込み」は実装前の想定であり、READMEには実測・実装結果を書く。
 
-> **実装後の結果は[README](../README.md)の「非機能要件の充足状況」が正である**（充足13／部分充足2／未充足8）。下表と食い違う場合はREADMEを正とし、差は§12.3に記す。実測との差はN08（充足見込み→**充足**、hash照合を実装）とN14（実測して記載→**充足**、p95 34.2 ms）の2件のみで、他は見込みどおりである。
+> **実装後の結果は[README](../README.md)の「非機能要件の充足状況」が正である**（充足13／部分充足2／未充足8）。下表と食い違う場合はREADMEを正とし、差は§12.3・§12.4に記す。実測との差はN08（充足見込み→**充足**、hash照合を実装）とN14（実測して記載→**充足**、p95 34.2 ms）の2件のみで、他は見込みどおりである。
+>
+> フェーズ2.5では**区分は動いていない**。N01・N03・N08 の根拠が増えた（位置検査と escape の再設計、422 メッセージからのキー名除去、hash 検査対象と load 対象の一致）だけで、充足13／部分充足2／未充足8 は変わらない。
 
 | ID | 要件（出典） | 見込み |
 | --- | --- | --- |
@@ -597,7 +611,7 @@ JSON モードとも）。したがって `{"confidence": 1}` でも復元でき
    token 化は1回だけ行うべき（SHOULD）**と明記した。fake backend は呼び出しごとの map で準拠する
    （キャッシュは呼び出しを越えて保持しない。§15.2 の記録禁止と同じ理由）。
 
-**理由**: §5.2 の A0 展開は候補ごとに state を繰り返すため、最大 32 質問 × 255 候補 = 8,160 系列になる。
+**理由**: §5.2 の A0 展開は候補ごとに state を繰り返すため、最大 256 質問 × 255 候補 = 65,280 系列になる（当時は質問数上限が 32 で 8,160 系列だった。ADR-016 で 256 に上げた）。
 D6 はこれを「PoC の同時実行数では許容する」としていたが、fake backend（`len()` を数えるだけ）ですら
 1.6 MB body 1 件で server 全体が約3秒止まった。実 tokenizer では分単位になる。さらに、テンプレートが
 instructions も候補ごとに繰り返すため、**hypothesis の構築そのもの**が候補数×instructions長 の
@@ -802,3 +816,133 @@ serializer に文字種判定が入り「英語の質問に日本語の文字が
 POC_RESULTS 第9章に記載した。要点は、Noul精度が低いこと（原因は既定候補文の可能性が高い）、
 CUDA OOM 経路が実地未検証であること、escape がモデル入力のテキストを変えること、
 **実 Jev との照合（G5）を一度も行っていないこと**、レイテンシーを1点しか測っていないこと。
+
+---
+
+### 12.4 フェーズ2.5（レビュー指摘の反映、2026-09-21）
+
+フェーズ2の成果物に対し security / architecture / QA の3系統のレビューを行い、その指摘を反映した。
+**bundle は `jevbert-poc-nli-ja-en-0.2.0`（backend `a0-nli-zeroshot-v2`）に上げた。** 理由は S-H1 の末尾に記す。
+
+#### S-H1. escape が tokenizer の正規化で迂回されていた（**最重要**）
+
+**症状**: 稼働中のサーバーに `state` として `＜s＞`（全角山括弧）を送ると **500 `inference_error`** が返った。
+全角山括弧は日本語入力で普通に現れ、500 は公式 SDK の既定 retry が 3 回叩く（U06）。
+仕様書 §6.2 / CT11 の保証「利用者が書いたものはデータのまま」が成立していなかった。
+
+**原因**: XLM-R fast tokenizer は特殊 token を照合する**前に** normalizer（`Precompiled` charsmap）を通す。
+フェーズ2の escape は生文字列の ASCII `<` しか見ていなかったので、正規化後に予約文字列になる綴りを素通しした。
+実測（実 tokenizer、`normalizer.normalize_str`）:
+
+| 入力 | 正規化後 | token ID |
+| --- | --- | --- |
+| `＜s＞`（U+FF1C / U+FF1E） | `<s>` | `[6, 0]` |
+| `＜/s＞` / `＜pad＞` / `＜mask＞` | `</s>` / `<pad>` / `<mask>` | `[6, 2]` / `[6, 1]` / `[6, 250001]` |
+| `＜unk＞` | `<unk>` | `[6, 3]`（**個数検査の対象外なので検知すらされない**） |
+| `<ｓ>`（全角 s） | `<s>` | `[6, 0]` |
+| `<﹤s﹥>`（U+FE64 / U+FE65） | `<<s>>` | `[4426, 0, 2740]` |
+| `<\x01s>`（C0 制御文字） | `<s>` | `[6, 0]` |
+
+**採用した設計**: 判定を `tokenizer.backend_tokenizer.normalizer.normalize_str` の出力に対して行い、
+正規化後に予約文字列が現れる入力に限り、**正規化すると `<` になる文字すべての直後へ空白を挿入する**（§5.4）。
+全 1,112,064 code point を走査した結果、`<` を生む文字は **`<` U+003C・`﹤` U+FE64・`＜` U+FF1C の 3 文字だけ**で、
+いずれも正規化結果はちょうど `"<"` である。この測定はテストで固定してある
+（`test_only_three_characters_fold_into_an_angle_bracket`）。
+
+**不採用にした案と理由**:
+
+| 案 | 不採用の理由（すべて実測に基づく） |
+| --- | --- |
+| **窓付き照合**（元テキスト側で `<` の周囲 N 文字を正規化して予約文字列か判定する） | charsmap は **C0 制御文字 30 個を削除する**（`\x01` → `""`）。`<` ＋ 制御文字を任意個 ＋ `s>` が `<s>` に正規化されるため、**有限幅の窓では原理的に検知できない**。実測で `<` + `\x01`×50 + `s>` → `<s>` を確認した |
+| **1文字ずつ正規化して元テキストへ位置対応を取る** | 正規化は文字単位で合成的ではない。結合文字が前の文字と合成されるため（`<ś>` の全体正規化は `<ś>`、1文字ずつの連結は `<s` + `́` + `>`）、添字対応が厳密に取れない。加えて1文字ごとの FFI 呼び出しになり費用も高い |
+| **`unicodedata.normalize("NFKC", ...)` で代用する** | charsmap と **181 code point で不一致**。特に NFKC は C0 制御文字を削除しないので、`<\x01s>` を**見逃す**。「NFKC 相当」という推測で実装してはならない実例 |
+| **ゼロ幅文字の除去を前提にする** | 実測では `​` / `‍` / `﻿` は削除ではなく**空白 1 個**になる（`<​s>` → `< s>`）。したがって元から無害であり、対策の対象ではなかった |
+
+**最終防壁を個数から位置へ**: `[bos] premise [eos,eos] hypothesis [eos]` の 4 つの制御 ID の位置を検査する
+（`misplaced_control_token`）。個数 4 の検査は「区切りがデータ側へ移り、利用者の token がその位置に入った系列」を
+通してしまう。**位置検査に違反した pair は、より強い escape（正規化後テキストに対して `<` の直後へ一律空白）で
+再 token 化し、それでも違反するときだけ例外**にする。利用者のテキストが 500 の原因になる経路を無くすためである。
+
+**bundle ID を上げた理由**: escape 規則は「bundle が生成するモデル入力」の一部であり、
+`<` を含む一部の入力で**以前と異なる系列**を作る（例: `"<<s>s>"` は旧 `"<< s>s>"`、新 `"< < s>s>"`）。
+仕様書 §5.7 は「既存の不変 ID のまま内容を更新してはならない」と定めている。
+escape の実装は compiler ではなく backend（§6.1 のとおり token 数計数と ID 組み立ては backend の責務）にあるため、
+**backend ID を `a0-nli-zeroshot-v2` に上げ**、manifest が変わることで bundle digest も動き、
+public ID を `jevbert-poc-nli-ja-en-0.2.0` に上げた。`serializer_version` は compiler が無変更のため
+`serializer-nli-v1+nli-template-v1` のまま据え置いた。fake bundle は compiler だけを使い、
+出力が 1 bit も変わらないため ID を据え置いた。
+
+> **上位文書との差分（要判断）**: 仕様書 §7.7 は PoC の backend を `a0-nli-zeroshot-v1` という名前で定義している。
+> 本書冒頭の規則は「仕様書と本書が矛盾する場合は仕様書を正とし、本書を直す」である。
+> ここでは**実装側を v2 に上げた**：escape 規則は「テキスト → token ID」という backend の契約そのものであり、
+> 同じ名前で別の系列を作るほうが §5.7 の趣旨に反すると判断した。
+> **仕様書側は変更していない**（上位文書の改訂は本フェーズの範囲外）。
+> 次の仕様書改訂で §7.7 の backend 名を `a0-nli-zeroshot-v2` に追従させるか、
+> escape 規則を backend 名とは別の版として持つかを決める必要がある。**未決事項として残す。**
+
+#### S-M3〜S-M5. 供給網の検査が「検査していない」箇所
+
+| ID | 変えた点 | 理由 |
+| --- | --- | --- |
+| S-M3 | manifest の `source_model.files` が **`fetch.SOURCE_FILES` を包含すること**を起動時と load 時の両方で要求する。モデルディレクトリ直下に allow-list 外のファイルがあれば load を拒否する | `config.json` 1 件だけ記録した manifest でも起動でき、`model.safetensors` は**未検証のまま**ロードされていた。`from_pretrained` はディレクトリ直下を名前で開くため、そこに置かれたファイルは「読まれうるが manifest が保証しないバイト」である。`.cache/`（huggingface_hub の記録）は serving 経路が読まないので対象外 |
+| S-M4 | `fetch-model` が manifest の `repo`・`revision` をコード内の固定値と照合し、違えば拒否する。`files` が空の初回取得は `--trust-first-fetch` を要求する。`record_source_hashes` は「記録済みだが今回の集合に無い」キーも conflict として報告する | manifest が別の repo を指していれば、その repo を取得して hash を bundle の身元として書き込んでいた。`files` が空の取得は比較対象が無い（TOFU）ので、運用者が明示的に選ぶ操作にした |
+| S-M5 | repo ID を `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` で検証。記録ファイル名に `/` `\` `..` 絶対パスを禁止 | `repo_id.replace("/", "--")` は Windows の `\` を無害化しない（`'..\\..\\evil'` が通った）。`mismatched_files` に渡る名前は manifest 由来なので、`../outside.txt` がモデルディレクトリ外を実際に読むことを確認した |
+
+#### S-L1・S-L3・S-L5. 残りのセキュリティ指摘
+
+- **S-L1**: 系列数の事前上限（§5.5）。256×255 = 65,280 系列が文字数 gate を通り、全部 token 化してから 422 になっていた。
+- **S-L3**: 422 の `msg` から**利用者のキー名を落とした**。場所は `path` / `detail[].loc` が示す。
+  メッセージはログや SDK の例外文字列に載って遠くまで運ばれるため、そこに利用者データを置かない（§15.2）。
+- **S-L5**: `_verify_files` → `from_pretrained` の TOCTOU は PoC では許容とし、`nli.py` の docstring と README N08 に明記した。
+  `max_batch_tokens` の `最長×件数` は **sdpa 前提**のメモリモデルであり、eager attention では `件数×head×最長²` の
+  一時行列が出ることをコメントに残した。`scripts/run_server.ps1` は loopback 以外の `-ServerHost` に警告を出す（TLS が無いため）。
+
+#### A-H1. 実モデルテストの隔離（衛生）
+
+レビュー中に `-m model` が約1割失敗したと報告されたが、**静止した作業ツリーでの 12 回連続実行はすべて 59 passed** であり、
+失敗の署名は同時刻に同じ作業ツリーで行われていた変異試験と一致していた（並行実行の干渉）。
+ただし構造上の指摘は正しいので直した:
+
+- `nli_client`（app 用 fixture）が session スコープの backend に対して**2回目の `load()`** を呼び、
+  実 `InferenceEngine`（別スレッド）へ渡していた。`backends/base.py` の「単一 encoder スレッドから呼ばれる」契約に反する。
+  app 用・smoke 用はそれぞれ**自前の backend を構築**する（1 インスタンス約 2.2 GB の VRAM は、
+  互いに干渉しないテストの対価として払う）。
+- 直したあと `-m model` を **20 回連続**実行した結果は POC_RESULTS §5.9。
+
+#### A-M2〜A-M6・A-L. アーキテクチャ指摘
+
+| ID | 変えた点 |
+| --- | --- |
+| A-M2 / A-M3 | `test_the_published_limit_says_256` と `test_a_404_carries_no_detail` は鍵が誤っていて常に 401 になり、`status_code in (200, 401)` を通過するだけだった。正しい認証で、`limits.max_questions == 256` と「認証済みの 404 本文に `detail` が無い」を実際に検査する |
+| A-M4 | `resolve_dtype` が CPU では宣言を見ずに float32 を返していたため、綴り誤りが CPU ホストでは無音・GPU ホストではロード失敗になっていた。**宣言の検証を device 判定より前に**移し、manifest の `dtype` を起動時に許容値集合で検査する。fake manifest の `"dtype": "none"`（未定義値）は `"not-applicable"`（テンソル計算をしない bundle の明示値）に変えた |
+| A-M5 | `RESERVED_STRINGS` を `tokenizer.all_special_tokens` と照合し、未知の特殊 token を持つ checkpoint は**ロード失敗**にする（リクエストごとの 500 ではなく readiness 失敗） |
+| A-M6 | 「重み hash が変われば digest が変わる」（README N11）を検査するテストが無かった（fake manifest は `source_model: null`）。実 bundle の manifest は JSON なので、重み無し・GPU 無しで検査できる |
+| A-L | `compat/differences.md` の L 表の並びを L06→L07→L08 に直し、tokenizer 自身が `model_max_length: 512` を宣言していること（manifest の 8192 は `max_position_embeddings` 由来）を R1 に明記した。`evaluation/smoke.py` の「`correct` と `error` のどちらか一方だけが設定される」を `__post_init__` で強制し、`failures()` が Score の誤差も報告できるようにした |
+
+#### Q-H1. smoke の下限が無情報予測器を検出できなかった
+
+変異試験で実証された: Noul を**定数 0.99** に固定しても全テスト通過（fixture が 10:10 均衡なので accuracy ちょうど
+0.500、下限 `>= 0.50` を等号で通過）、Score を**常に中央段階**にしても通過（誤差 0.375 ≦ 上限 0.41）。
+番人として機能していたのは Choice だけだった。
+
+`uninformative_baselines()` が「質問を読まない予測器」のスコアを **fixture から計算する**（noul 0.500 / choice 0.260 /
+score 0.375）。下限はその値と初回実測値の間に置き直した: **Noul ≧ 0.55**（旧 0.50）、**Score ≦ 0.36**（旧 0.41）。
+Choice は 0.85 のまま（多数派予測は 0.260 で遥かに下）。**これは下限を厳しくする変更であり、緩める変更ではない**
+（POC_RESULTS §4.2 に併記）。Score にも言語別ガードを追加した。
+
+#### Q-M1・Q-M2・Q-M4. テストの穴
+
+- **Q-M1**: microbatch の順序復元を壊しても落ちるのは統計的な smoke だけだった。既存テストの候補が全て同一 token 長で
+  `sorted()` が恒等置換になり、1 batch に収まっていたため。stub model（logit ＝ ID の総和なので結果が系列を一意に指す）
+  によるモデル不要の unit test と、長さの異なる候補＋`max_batch_sequences=2` の実モデルテストを追加した。
+- **Q-M2**: `JEVBERT_REQUIRE_MODEL=1` のとき、重み未取得の skip を **fail** にする。140 件の skip と 140 件の pass は
+  同じ緑のサマリ行を出す。
+- **Q-M4**: `scripts/sdk_demo.py` の `check_invariants` と `scripts/bench_latency.py` の `_percentile` は
+  AC2・AC6 の根拠を生成しながらテストが無かった。書いて 2 件見つかった: `check_invariants` は回答が 1 つ欠けると
+  `FAILED` を報告せず **KeyError で落ちていた**（各検査を callable にして、実行できない検査も `FAILED (KeyError)` と
+  報告する）。`bench_latency.py` の「各系列 512 token 以下」は**平均**で確認していた。候補が空の probe リクエストを
+  1 本追加して `(premise + 4)` を求め、**最長系列の上界**を計算して確認する形にした。
+
+#### 残った懸念（フェーズ2.5 時点）
+
+POC_RESULTS 第9章に更新して記載した。

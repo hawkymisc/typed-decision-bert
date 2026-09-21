@@ -47,6 +47,7 @@ Jev 互換を 3 区分で正直に書く。**「Jev 互換」と言い切れる�
 | 422 本文の `detail` 配列（`loc` が `"body"` 始まり、質問 ID の後に型 tag）を SDK 経由で読めること | `test_a_422_body_carries_jev_s_detail_array` |
 | `detail` の併記が例外メッセージを変えないこと | `test_the_detail_array_does_not_change_the_exception_message` |
 | 256 質問のリクエスト | `test_many_questions_are_accepted` |
+| **日本語入力に現れる全角記号（`＜/s＞` 等）が 200 で返ること** | `test_a_reserved_string_in_any_field_is_answered_not_refused` |
 | `strict=True` の応答検証が通ること（float の扱いを含む） | `TestStrictValidationObservations` |
 | Score の `legend` が object / array の型を保って復元されること | `tests/sdk/` |
 
@@ -72,6 +73,16 @@ Jev 互換を 3 区分で正直に書く。**「Jev 互換」と言い切れる�
 さらに、`confidence`・`usage.input_tokens`・`response.model` は**意図的に一致しない**
 （モデルが違う以上一致させられない）。詳細は [compat/differences.md](compat/differences.md)。
 
+### D. Jev が受理する要求のうち、JevBERT が**形式上の理由で**拒否しうるもの
+
+[compat/differences.md の R1〜R13](compat/differences.md) に、影響と回避策つきで一覧してある。
+要約すると、1 系列 2,048 token・1 リクエスト 131,072 token・展開後 26,214 系列・524,288 文字が上限で、
+そのほかは Choice/Score の件数範囲と厳格 JSON の規則である。**ここに無いものを形式で拒否することはない。**
+
+**利用者が書いたテキストそのものが拒否の理由になることはない。**
+`＜/s＞` のような全角の予約文字列は、モデル入力の直前で無害化して 200 を返す
+（[differences.md L08・L09](compat/differences.md)）。フェーズ2 ではここが 500 になっていた。
+
 ---
 
 ## セットアップ
@@ -79,7 +90,7 @@ Jev 互換を 3 区分で正直に書く。**「Jev 互換」と言い切れる�
 ```bash
 uv sync
 uv run python -m jevbert init-env            # .env に API key を生成（32文字未満の鍵では起動しない）
-uv run python -m jevbert fetch-model         # 固定 revision を取得し manifest へ SHA-256 を記録（約 1.1 GB）
+uv run python -m jevbert fetch-model --trust-first-fetch   # 固定 revision を取得し manifest へ SHA-256 を記録（約 1.1 GB）
 uv run python -m jevbert serve --config configs/jevbert.poc.yaml   # 127.0.0.1:8765
 ```
 
@@ -94,7 +105,21 @@ uv run ruff check
 ```
 
 `fetch-model` は冪等である。2 回目以降はローカルファイルの SHA-256 を manifest と照合し、
-一致すれば何も取得しない。一致しなければ**上書きせずエラーで知らせる**。
+一致すれば何も取得しない。一致しなければ**上書きせずエラーで知らせる**。2 回目以降に
+`--trust-first-fetch` は要らない。
+
+`--trust-first-fetch` は初回だけ必要である。manifest にまだ hash が無い状態では、
+**取得したものを検証する材料が無く、取得結果がそのまま bundle の身元になる**（trust on first use）。
+これは運用者が明示的に選ぶ操作であり、フィールドが空だったから起きる操作ではない。
+manifest が指す repo・revision がこのビルドの固定値と違えば、`fetch-model` は**取得せずに拒否する**。
+
+```bash
+uv run pytest                                # モデル未取得なら model マーカー 140 件は skip
+JEVBERT_REQUIRE_MODEL=1 uv run pytest        # その skip を失敗にする（検証時はこちら）
+```
+
+`model` マーカーの 140 件が skip されたときのサマリ行は、それらが通ったときと見分けがつかない。
+実モデルまで含めて確認したい実行では `JEVBERT_REQUIRE_MODEL=1` を付ける。
 
 ## API の使い方
 
@@ -116,7 +141,7 @@ with TypeSafeClient(base_url="http://127.0.0.1:8765", api_key="<.env の鍵>") a
             ),
         },
     )
-print(response.model)                       # jevbert-poc-nli-ja-en-0.1.0（alias ではなく不変 ID）
+print(response.model)                       # jevbert-poc-nli-ja-en-0.2.0（alias ではなく不変 ID）
 print(response.answers["department"].choice)
 ```
 
@@ -140,27 +165,27 @@ print(response.answers["department"].choice)
 
 | ID | 要件 | 状況 | 根拠（テスト名・計測値・未実装の理由） |
 | --- | --- | --- | --- |
-| N01 | 出力の型・有限性・候補対応をモデル精度から独立に検証 | **充足** | `contracts/response.py` が送信前に毎回 I01〜I09 を検査し違反は 500。`tests/unit/test_response.py`、`tests/property/test_response_properties.py`（PT02）、実モデルでは `test_the_invariants_hold_on_a_real_distribution`。`confidence` は分布から再計算して照合する |
+| N01 | 出力の型・有限性・候補対応をモデル精度から独立に検証 | **充足** | `contracts/response.py` が送信前に毎回 I01〜I09 を検査し違反は 500。`tests/unit/test_response.py`、`tests/property/test_response_properties.py`（PT02）、実モデルでは `test_the_invariants_hold_on_a_real_distribution`。`confidence` は分布から再計算して照合する。AC2 の根拠を作る `scripts/sdk_demo.py` の検査器自体も `tests/unit/test_scripts.py` で不変条件ごとに検査する |
 | N02 | 数値異常時に一様分布・0.5 で成功扱いしない | **充足** | NaN・inf logit と候補数不一致は 500 で、本文に確率を含めない（CT08、`tests/contract/test_numeric_contract.py`）。backend 側でも非有限 logit は例外（`nli.py`） |
-| N03 | 生入力・認証情報を標準ログに保存しない | **充足** | 1 リクエスト 1 行の JSON に state・instructions・criteria・候補キー・質問 ID・鍵を含めない。例外メッセージと `exc_info` も出さない。`tests/contract/test_logging.py` が sentinel 文字列で検査。実サーバーの出力は POC_RESULTS §7.4 |
+| N03 | 生入力・認証情報を標準ログに保存しない | **充足** | 1 リクエスト 1 行の JSON に state・instructions・criteria・候補キー・質問 ID・鍵を含めない。例外メッセージと `exc_info` も出さない。**422 の `message` も利用者のフィールド名を引用しない**（場所は `path` / `detail[].loc` が示す。`TestSL3UnknownFieldNameIsNotReflected`）。`tests/contract/test_logging.py` が sentinel 文字列で検査。実サーバーの出力は POC_RESULTS §7.4 |
 | N04 | batch 化してもattention・回答対応・認可境界を混ぜない | **部分充足** | リクエスト間 batching を実装していない（N23）ので混同は構造的に起きない。並行リクエストの回答が混ざらないことは `TestCT12RequestIsolation` で確認。**単一 tenant のみ**（N19） |
 | N05 | 無断 truncation なし、overflow は reject | **充足** | `truncation=False`。token 上限超過は 422 `context_length_exceeded`。CT06、実モデルでは `test_nothing_is_truncated` と `test_an_oversized_request_is_refused_not_truncated` |
 | N06 | 原子性：部分 200 なし | **充足** | 1 件でも無効な質問があれば推論前に全体を拒否。CT05（`tests/contract/test_request_contract.py`） |
 | N07 | ローカル推論、外部への無断転送・無断学習なし | **充足** | サーバーは `local_files_only=True` でのみロードし、ネットワークに出ない。`allow_remote_model_download: false` は設定で固定（`Literal[False]`）。取得は `fetch-model` のみ |
-| N08 | supply chain：依存 lock、revision・hash 固定、任意コード実行なし、safetensors | **充足** | `uv.lock`、revision をコミット SHA で固定、`trust_remote_code=False`、`*.bin` を取得しない allow-list、manifest の 6 ファイル SHA-256 をロード時に照合（`tests/unit/test_fetch.py`、`TestWeightVerification`） |
+| N08 | supply chain：依存 lock、revision・hash 固定、任意コード実行なし、safetensors | **充足** | `uv.lock`、revision をコミット SHA で固定、`trust_remote_code=False`、`*.bin` を取得しない allow-list、manifest の 6 ファイル SHA-256 をロード時に照合（`tests/unit/test_fetch.py`、`TestWeightVerification`）。**記録済み hash はロードするファイルすべてを覆っていなければ起動しない**、モデルディレクトリ直下の allow-list 外ファイルは拒否、manifest は repo・revision を差し替えられない、初回取得は `--trust-first-fetch` が要る。**既知の限界**: hash 照合と `from_pretrained` の間に TOCTOU の窓があり、PoC では許容している |
 | N09 | readiness/liveness 分離、hash 整合、warmup | **充足** | lifespan で hash 照合 → ロード → warmup → 最小 fixture。全て成功するまで `/readyz` は 503。失敗してもプロセスは落とさない。`TestReadiness`、実測は POC_RESULTS §7.1 |
 | N10 | 過負荷 529・deadline 504、無制限に積まない | **充足** | admission（既定 8、encode も枠を消費）超過で 529、deadline 30 秒超過で 504。`TestOverloadAndDeadline`、`TestEncodingIsAdmissionControlled` |
-| N11 | bundle 不変 ID・digest、版の追跡 | **充足** | bundle digest = manifest の canonical JSON の SHA-256。重み hash・dtype・温度・serializer のどれが変わっても digest が変わる（`tests/unit/test_registry.py`）。template を変えた manifest は起動を拒否 |
+| N11 | bundle 不変 ID・digest、版の追跡 | **充足** | bundle digest = manifest の canonical JSON の SHA-256。重み hash・dtype・温度・serializer のどれが変わっても digest が変わる（`TestTheDigestCoversTheWeights` が実 bundle の manifest で検査）。template を変えた manifest は起動を拒否。**escape 規則を変えたフェーズ2.5 では bundle ID を `0.2.0` へ上げた**（仕様書 §5.7、POC_DESIGN §12.4） |
 | N12 | 推論 cache 既定無効 | **充足** | cache を実装していない。`result_cache_enabled` は `Literal[False]`。premise の token 化 map は 1 呼び出し内のみ |
 | N13 | 入力を権限にしない | **充足** | ツール実行・外部アクセス・モデル選択権限のいずれも入力から変更できない。`TestFakeInjectionIsUnreachable`（fake backend の注入口が request / manifest / 設定のどれからも届かないこと） |
-| N14 | レイテンシー目標 p95 ≦ 250 ms（§14.3） | **充足** | **実測 p95 = 34.2 ms**（p50 33.4 / p99 34.5、Q=4・K=8・同時実行 1・warm・100 回）。POC_RESULTS 第6章。**ただし測ったのはこの 1 点のみ** |
+| N14 | レイテンシー目標 p95 ≦ 250 ms（§14.3） | **充足** | **実測 p95 = 34.2 ms**（p50 33.4 / p99 34.5、Q=4・K=8・同時実行 1・warm・100 回）。POC_RESULTS 第6章。「各系列 512 token 以下」はフェーズ2.5 から**最長系列の上界**で確認する（平均ではない。POC_RESULTS §6.1）。**ただし測ったのはこの 1 点のみ** |
 | N15 | 観測項目・metrics・drift | **部分充足** | 構造化ログ（段階別所要時間・系列数・token 数・`error_code`）のみ。**metrics endpoint・drift 監視は未実装** |
 | N16 | 校正済み確率（G3） | **未充足** | `uncalibrated`、T = 1.0 固定。校正データも校正器もない。capabilities と `X-JevBERT-Calibration` で明示 |
-| N17 | 業務品質・指示追従の評価（G2） | **未充足** | 52 件の smoke 評価のみ（傾向の記録）。Noul accuracy 0.650・Choice 1.000・Score 平均誤差 0.261。統計設計・アノテーター複数・区間推定のいずれもない |
-| N18 | 利用者別 rate limit 429 | **未充足** | 個人 PoC の単一利用者を想定（ADR-015）。`RateLimitExceededError` は定義のみで誰も送出しない |
+| N17 | 業務品質・指示追従の評価（G2） | **未充足** | 52 件の smoke 評価のみ（傾向の記録）。Noul accuracy 0.650・Choice 1.000・Score 平均誤差 0.261。統計設計・アノテーター複数・区間推定のいずれもない。**Noul の否定例は「別の話題を尋ねる」型しかなく、極性反転の hard negative が無い**ので、測れているのは実質「話題一致」である（POC_RESULTS §4.3）。回帰の番人としての下限は無情報予測器より厳しい側へ引き上げた（同 §4.2） |
+| N18 | 利用者別 rate limit 429 | **未充足** | 個人 PoC の単一利用者を想定（ADR-015）。`RateLimitExceededError` は定義のみで誰も送出しない。**したがって 429 に対する SDK の挙動も試験できていない**（POC_DESIGN §8.3） |
 | N19 | tenant 分離 | **未充足** | 単一 tenant。CT12 は「並行リクエストの回答が混ざらない」ことに縮小 |
 | N20 | 運用：負荷試験、OOM 試験、graceful shutdown、rollback、監視、データ保持 | **未充足（一部のみ）** | deadline / 529 / engine の graceful shutdown は実装済み。**負荷試験（同時実行 8/32）・OOM 試験・rollback 手順・監視は未実施**。CUDA OOM の処理経路は実装済みだが本環境で一度も発火しておらず実地未検証 |
-| N21 | 通信路保護（TLS） | **未充足** | TLS なし。既定 bind を `127.0.0.1` にして緩和 |
+| N21 | 通信路保護（TLS） | **未充足** | TLS なし。既定 bind を `127.0.0.1` にして緩和。`scripts/run_server.ps1` は loopback 以外の `-ServerHost` に警告を出す |
 | N22 | 実 Jev との照合（G5）、JavaScript SDK | **未実施** | 実 API key での照合を一度も行っていない。JavaScript SDK は未試験 |
 | N23 | GPU batch 待機によるリクエスト間 batching | **未実装** | PoC では意図的に実装しない（N04 の構造的保証と引き換え） |
 

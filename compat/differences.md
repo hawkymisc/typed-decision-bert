@@ -2,8 +2,8 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 版 | 0.2.0（2026-09-21）。P0.5 フェーズ2（実モデル backend・互換性優先の反映）時点 |
-| 典拠 | [仕様書](../JevBERT_spec_design.md) §2.3, §3.3, §3.4, §5, §6, §18.3, ADR-016；[POC_DESIGN](../docs/POC_DESIGN.md) §5.1, §12.3 |
+| 版 | 0.3.0（2026-09-21）。P0.5 フェーズ2.5（レビュー指摘の反映）時点。対象 bundle は `jevbert-poc-nli-ja-en-0.2.0`（backend `a0-nli-zeroshot-v2`） |
+| 典拠 | [仕様書](../JevBERT_spec_design.md) §2.3, §3.3, §3.4, §5, §6, §18.3, ADR-016；[POC_DESIGN](../docs/POC_DESIGN.md) §5.1, §12.3, §12.4 |
 | 参照した上流の版 | [compat/upstream/README.md](upstream/README.md) |
 
 **本書の最重要点**: 以下の「差分」は、実 Jev API と照合して確認したものでは**ない**。JevBERT 側の
@@ -25,8 +25,8 @@ ADR-016 の方針は「Jev が受理し得る要求を、形式だけを理由�
 
 | # | 拒否されうる要求 | status / code | 根拠 | 回避策 |
 | --- | --- | --- | --- | --- |
-| R1 | **1 系列の token 数が 2,048 を超える**（state＋指示＋1 候補＋制御 token） | 422 `context_length_exceeded` | モデル上限は 8,192 だが PoC の実効上限を 2,048 に絞っている（仕様書 §4.2）。切り詰めは禁止（`overflow_policy: reject`） | 設定 `limits.max_sequence_tokens` を上げる（manifest の `model_max_sequence_tokens` = 8192 が天井）。長文は呼び出し側で分割する |
-| R2 | **リクエスト内の全系列 token 合計が 131,072 を超える** | 422 `context_length_exceeded` | A0 系は候補ごとに state を繰り返すため、同じ body でも A1 の数倍の token を数える（L04） | 質問数・候補数を減らす。A1 bundle では増幅が消える |
+| R1 | **1 系列の token 数が 2,048 を超える**（state＋指示＋1 候補＋制御 token） | 422 `context_length_exceeded` | manifest の `model_max_sequence_tokens` は 8,192 だが、これは backbone の `max_position_embeddings` 由来の値である。**tokenizer 自身は `model_max_length: 512` を宣言しており**、512 を超える系列では transformers が警告を出す（PoC の実効上限 2,048 はその間に位置する。仕様書 §4.2）。切り詰めは禁止（`overflow_policy: reject`） | 設定 `limits.max_sequence_tokens` を上げる。長文は呼び出し側で分割する。**512 超の系列で品質がどうなるかは未計測**（POC_RESULTS §6 の計測は 66 token/系列のみ） |
+| R2 | **リクエスト内の全系列 token 合計が 131,072 を超える** | 422 `context_length_exceeded` | A0 系は候補ごとに state を繰り返すため、同じ body でも A1 の数倍の token を数える（L04）。系列の**件数**だけで超過が確定する場合は token 化前に拒否する（R13） | 質問数・候補数を減らす。A1 bundle では増幅が消える |
 | R3 | **展開後の文字数合計が 524,288 を超える** | 422 `context_length_exceeded` | token 化の前に置いた安価な門（L07）。係数 4 は意図的に緩く、token 上限で通る要求がここで落ちることはほぼ無い | `limits.max_request_chars` を上げる |
 | R4 | **Choice の候補が 1 個**、または 256 個以上 | 422 `validation_error` | 仕様書 §5.3 の 2〜255。候補 1 個の分布は常に `{k: 1.0}` で情報が無い。**Jev が 1 候補を受理するかは未確認** | 候補を 2 個以上にする |
 | R5 | **Score の段階が 1 個**、または 11 個以上 | 422 `validation_error` | 仕様書 §5.3 の 2〜10 | 段階を 2〜10 にする |
@@ -37,6 +37,7 @@ ADR-016 の方針は「Jev が受理し得る要求を、形式だけを理由�
 | R10 | **body が 2 MiB 超**、`Content-Type` が `application/json` 以外、`Content-Encoding` が `identity` 以外 | 413 / 415 | 仕様書 §4.2 | 圧縮せずに送る、分割する |
 | R11 | **未登録の `jev-*` モデル名**（`jev-1.13.0` など） | 422 `model_not_found` | ワイルドカードで受理すると、その版の Jev を実行したと誤認させる（仕様書 §18.3） | `jev-latest`・`jev-preview`、または不変 ID を使う |
 | R12 | **同時実行 9 件以上 / 30 秒超過** | 529 `overloaded` / 504 `deadline_exceeded` | 単一 GPU worker の PoC 構成。Jev 側の閾値は未確認 | `max_pending_requests`・`request_deadline_seconds` を上げる |
+| R13 | **展開後の系列数が 26,214 を超える**（= `max_request_tokens ÷ 5`） | 422 `context_length_exceeded` | 1 系列は制御 token 4 個＋データ 1 個を下回れないので、これを超える系列数は R2 を満たしようがない。**token 化する前に件数だけで判定する**（256 質問 × 255 候補 = 65,280 系列は文字数 gate を通ってしまうため。S-L1） | 質問数×候補数を減らす。最悪系列数と所要時間は POC_RESULTS §5.8 |
 
 ### エラー本文の外形について
 
@@ -85,18 +86,19 @@ ADR-016 の方針は「Jev が受理し得る要求を、形式だけを理由�
 | U05 | `confidence` の具体式、token 計数の完全な再現条件が未確認 | 数値互換の対象から除外（D02・D03） | 解消見込みなし。定義 ID を版管理して差分を可視化する |
 | U06 | SDK docs の retry 対象 status と実装既定が食い違う | 実装を正とする（408・429・500〜599 を既定で最大 2 回再試行） | SDK 0.7.0 実装で確認済み。**`inference_error`（500）のような再試行しても回復しない失敗も既定で再試行される**。推論は副作用を持たないため安全だが、利用者には差分として明示する |
 
-## L: PoC 限りの実装制限（`serializer-nli-v1`）
+## L: PoC 限りの実装制限（`serializer-nli-v1+nli-template-v1`、backend `a0-nli-zeroshot-v2`）
 
 | ID | 制限 | 影響 | 解消予定 |
 | --- | --- | --- | --- |
 | L01 | `render()` が、トップレベルの文字列 `"[1]"` と配列 `[1]` を同じテキストに落とす | state や criteria がこの 2 つで意味的に異なる場合、モデルは区別できない。API の型保存（応答の `legend` 等）には影響しない | `serializer-v1`（A1 用）には持ち込まない（POC_DESIGN §5.1） |
 | L02 | Choice 候補を `"<key>: <description>"` の形で描画するため、候補 `"a"`（説明 `"b"`）と候補 `"a: b"`（説明 null）が同一の hypothesis になる | 両候補のモデル入力が同一になり、同一 logit → 同率になる。API は与えられたキー集合に対する分布を返すので構造は壊れないが、**モデルはその 2 候補を区別できない**。フェーズ1で発見（`tests/contract/test_markers.py`） | 区切りを制御 ID 側へ移す、または key と description を別フィールドとして渡す設計で解消する。A1 の `serializer-v1` ではキーと説明を `typed_json({name, description})` として分離する（仕様書 §6.2）ため、この衝突は起きない |
-| L03 | zero-shot NLI backend（`a0-nli-zeroshot-v1`）は JevBERT の学習成果物ではない。指示追従・Score の順序性・日本語品質はいずれも**未評価** | 品質主張に使えない。G2・G3 を通過したものとして扱わない | 学習済み A1 bundle への置き換え（仕様書 §7.7、ADR-011） |
+| L03 | zero-shot NLI backend（`a0-nli-zeroshot-v2`）は JevBERT の学習成果物ではない。指示追従・Score の順序性・日本語品質はいずれも**未評価** | 品質主張に使えない。G2・G3 を通過したものとして扱わない | 学習済み A1 bundle への置き換え（仕様書 §7.7、ADR-011） |
 | L04 | 候補ごとに state を繰り返すため、`usage.input_tokens` と計算量が候補数に比例する | `max_request_tokens` の実効値を 131,072 に引き上げている（仕様書 §4.2 の 32,768 は A1 の 1 質問 1 系列を前提とした値）。capabilities で公開する | A1 bundle で `expanded-input-v1` に戻る |
 | L05 | `fake-deterministic-v1` bundle は入力のハッシュを返すだけで、回答に意味はない | 設定で明示的に有効化したときだけ登録される（既定は無効）。**その出力をモデル出力として提示してはならない** | PoC 限り。contract 試験専用 |
 | L06 | `instructions` が空文字列 `""` のとき、`nli-template-v1` の「指示なし」側を使う（`"{C}"`）。`[]` と `{}` は `"[]"` / `"{}"` に描画されるので従来どおり指示として扱う | `"{I} — {C}"` に空の `I` を入れると全候補が `" — "` で始まり、モデルから見れば意味のある区切りに見える。API の構造は変わらない。**空文字列と「指示なし」を区別したい呼び出し側は区別できない**（実 Jev がどう扱うかは未確認） | A1 の `serializer-v1` は指示を `typed_json` の独立フィールドとして渡すため、空文字列がテンプレート構造に漏れない |
-| L08 | **予約文字列を escape するため、モデルが見るテキストが元の入力と一致しない。** `</s>` → `< /s>`、`<s>` → `< s>`、`<pad>`・`<unk>`・`<mask>` も同様に `<` の直後へ空白が 1 つ入る | tokenizer の `split_special_tokens=True` が実測で効かず（制御 token ID が 6 個データ中に残った。POC_RESULTS §5.2）、データと制御 ID を分離する（仕様書 §6.2、CT11）ために採った手段。**API の型保存・応答の `legend`・候補キー集合には影響しない**（escape はモデル入力の直前にだけ適用され、応答は元の値を返す）。影響するのは「モデルが読む文字列」だけで、`<s>` を含む文章の意味がわずかに変わりうる。大文字（`<S>` 等）は tokenizer が特殊 token として扱わないため escape しない | 制御 token を語彙に持たない backbone、または offset ベースで marker を挿入する `serializer-v1`（仕様書 §6.2）で不要になる |
 | L07 | 1リクエストあたりの展開後**文字数**に上限 `max_request_chars`（既定 `4 × max_request_tokens`）がある。超過は 422 `context_length_exceeded` | A0 系は候補ごとに state と instructions を繰り返すため、小さな body が数百万文字のモデル入力に膨らむ。token 上限より手前の安価な門であり、**token 上限では受理されうるリクエストが文字数で拒否されることはほぼ無い**（係数 4 は意図的に緩い）。実 Jev にこの上限は無いと思われるが未確認 | A1 の 1質問1系列では増幅が起きないため不要になる見込み |
+| L08 | **予約文字列を含むテキストだけ、モデルが見る文字列が元の入力と一致しない。** 正規化後に `</s>` `<s>` `<pad>` `<unk>` `<mask>` のいずれかが現れる入力に対し、**正規化すると `<` になる文字すべて**（`<` U+003C・`﹤` U+FE64・`＜` U+FF1C の 3 文字。全 Unicode を実測して確定）の直後へ空白を 1 つ入れる。`a<s>b` → `a< s>b`、`＜/s＞` → `＜ /s＞` | tokenizer は特殊 token を照合する**前に**自前の normalizer（precompiled charsmap）を通すため、生の ASCII だけを見る escape は全角・互換形で迂回された（フェーズ2の実装は `＜s＞` で 500 を返していた。POC_DESIGN §12.4、S-H1）。判定は tokenizer 自身の normalizer の出力に対して行う。**正規化後に予約文字列が現れない入力は 1 文字も変えない**ので、`a < b` や `<div>` のような普通の文はそのままモデルへ渡る。大文字（`<S>` 等）も tokenizer が特殊 token として照合しないため変えない。**API の型保存・応答の `legend`・候補キー集合には影響しない**（escape はモデル入力の直前にだけ適用され、応答は元の値を返す） | 制御 token を語彙に持たない backbone、または offset ベースで marker を挿入する `serializer-v1`（仕様書 §6.2）で不要になる |
+| L09 | escape のあとでも制御 token がデータ位置に残った場合、**より強い escape**（正規化後のテキストに対して `<` の直後へ一律空白）で再 token 化する。それでも残るときだけ 500 `inference_error` | 利用者が書いたテキストが 500 の原因になってはならない（500 は SDK の既定 retry が 3 回叩く。U06）。**この経路が発火すると、そのリクエストのモデル入力は互換文字が正規化形に畳まれたものになる**（`＜` → `<` 等）。発火は operator 向けログに残る（入力は残さない）。**本実装では実入力で一度も発火していない**（発火させるには escape を無効化する必要がある） | L08 と同じ |
 
 ## 未確認事項（実 Jev 照合が必要なもの）
 
@@ -110,6 +112,13 @@ ADR-016 の方針は「Jev が受理し得る要求を、形式だけを理由�
 - 実 Jev の入力長上限（リクエスト 64k / state と最長質問 32k という記載の実挙動）
 - 同一入力に対する実 Jev と JevBERT の判断一致率（仕様書 §13.6 の比較指標）
 - JavaScript SDK での動作（C2 の後続）
+
+## JevBERT 内部の未決事項（Jev とは無関係）
+
+- **仕様書 §7.7 は PoC backend を `a0-nli-zeroshot-v1` と名付けているが、実装は `a0-nli-zeroshot-v2` である。**
+  フェーズ2.5 で escape 規則（テキスト → token ID の対応）を変えたため、同じ名前を使い回さない判断をした
+  （POC_DESIGN §12.4）。**仕様書側は未改訂**であり、次の改訂で名前を追従させるか、
+  escape 規則を backend 名とは別の版として持つかを決める必要がある。
 
 これらは G5（実 Jev 置換検証）の対象であり、許可された認証情報・データ・予算が用意できた時点で
 `compat/fixtures/` に観測を残したうえで本書を更新する。

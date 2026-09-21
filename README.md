@@ -96,6 +96,25 @@ uv run python -m jevbert serve --config configs/jevbert.poc.yaml   # 127.0.0.1:8
 
 Windows では `./scripts/run_server.ps1` が上記を順に確認して起動する。
 
+### 端末を閉じても動かし続ける・止める（Windows）
+
+`serve` はフォアグラウンドで動く。端末やセッションから切り離して動かすには、PowerShell で次のように起動する
+（ログは `logs/`、gitignore 対象）。サービス登録はしていないので、**OS を再起動したら起動し直す**。
+
+```powershell
+$env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
+Start-Process -FilePath .venv\Scripts\python.exe `
+  -ArgumentList "-m","jevbert","serve","--config","configs/jevbert.poc.yaml" `
+  -RedirectStandardOutput logs\server.out.log -RedirectStandardError logs\server.err.log `
+  -WindowStyle Hidden
+```
+
+稼働確認は `GET http://127.0.0.1:8765/readyz`（200 なら準備完了）。止めるときは 8765 を LISTEN しているプロセスを終了する。
+
+```powershell
+Stop-Process -Id (Get-NetTCPConnection -LocalPort 8765 -State Listen).OwningProcess
+```
+
 ```bash
 uv run python scripts/sdk_demo.py            # 公式 SDK から §5.6 の例を送る（AC2）
 uv run python scripts/bench_latency.py       # §14.3 の条件でレイテンシーを測る（AC6）

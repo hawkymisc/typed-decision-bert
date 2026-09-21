@@ -1,4 +1,4 @@
-"""Security review findings of phase 1.5 (S-H1, S-M1, S-M2, S-M3, S-L1, S-L2).
+"""Security review findings (phase 1.5 S-H1..S-L2, phase 2.5 S-L3).
 
 Each test here fixes a behaviour that the review found missing, not an implementation
 detail: a hostile header must not become a 500, a hostile literal must not become a 500,
@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from jevbert.config import Limits, ServingSettings
+from jevbert.config import CompatSettings, Limits, ServingSettings
 from tests.conftest import (
     API_KEY,
     AUTH,
@@ -158,6 +158,40 @@ class TestSL1DuplicateKeyMessage:
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "invalid_json"
         assert "CANARY-DUPLICATE-KEY" not in response.text
+
+
+class TestSL3UnknownFieldNameIsNotReflected:
+    """S-L3: the 422 said which field, by quoting the caller's own key.
+
+    ``path`` and ``detail[].loc`` already point at it, and they are structure rather
+    than prose - a log line or an error tracker that keeps the message keeps the key
+    (spec 15.2). The location stays; the quotation goes.
+    """
+
+    def test_a_question_s_unknown_field_name_stays_out_of_the_message(self) -> None:
+        with build_client(settings=build_settings()) as client:
+            response = systemone(
+                client, request_body({"q": {"type": "noul", "CANARY-FIELD": 2}})
+            )
+        assert response.status_code == 422
+        payload = response.json()
+        assert "CANARY-FIELD" not in payload["error"]["message"]
+        assert "CANARY-FIELD" not in payload["detail"][0]["msg"]
+        # The caller can still find it: the path and the loc say exactly where.
+        assert payload["error"]["path"] == ["questions", "q", "CANARY-FIELD"]
+        assert payload["detail"][0]["loc"] == ["body", "questions", "q", "noul", "CANARY-FIELD"]
+
+    def test_a_top_level_unknown_field_name_stays_out_of_the_message(self) -> None:
+        settings = build_settings(compat=CompatSettings(unknown_top_level_fields="reject"))
+        body = request_body(NOUL)
+        body["CANARY-FIELD"] = 1
+        with build_client(settings=settings) as client:
+            response = systemone(client, body)
+        assert response.status_code == 422
+        payload = response.json()
+        assert "CANARY-FIELD" not in payload["error"]["message"]
+        assert "CANARY-FIELD" not in payload["detail"][0]["msg"]
+        assert payload["error"]["path"] == ["CANARY-FIELD"]
 
 
 class TestSL2ReadyzDisclosure:

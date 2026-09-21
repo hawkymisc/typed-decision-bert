@@ -25,6 +25,11 @@ _COMMON_FIELDS = frozenset({"type", "instructions", "criteria"})
 _TOP_LEVEL_FIELDS = ("model", "state", "questions")
 _NOUL_CRITERIA_KEYS = frozenset({"true", "false"})
 
+#: The field's own name is the caller's data, and a message travels further than a body:
+#: into logs, exception trackers and SDK exception strings. ``path`` and ``detail[].loc``
+#: already say exactly which field it was, so the message does not have to (S-L3).
+_UNKNOWN_FIELD = "The field named by `path` is not part of the request contract."
+
 
 @dataclass(frozen=True)
 class NoulQuestion:
@@ -87,7 +92,7 @@ def validate_request(
     if unknown_top_level_fields == "reject":
         for field in value:
             if field not in _TOP_LEVEL_FIELDS:
-                raise ValidationError(f"Unknown field `{field}`.", path=[field])
+                raise ValidationError(_UNKNOWN_FIELD, path=[field])
 
     model = value["model"]
     if not isinstance(model, str) or not model:
@@ -144,7 +149,7 @@ def _validate_typed_question(question_id: str, raw: Any, limits: Limits) -> Ques
         )
     for field in raw:
         if field not in _COMMON_FIELDS:
-            raise ValidationError(f"Unknown field `{field}`.", path=[*base, field])
+            raise ValidationError(_UNKNOWN_FIELD, path=[*base, field])
 
     instructions = raw.get("instructions")
     if not _is_entry(instructions):

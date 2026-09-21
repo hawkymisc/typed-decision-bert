@@ -249,6 +249,17 @@ def _choice_candidate(key: str, description: Entry) -> str:
     return f"{key}: {render(description)}"
 
 
+#: The cheapest a sequence can possibly be: the four control tokens the backend inserts
+#: plus one token of data. Dividing the request's token budget by it gives the largest
+#: number of sequences that could ever fit, which is decidable by counting (S-L1).
+MIN_TOKENS_PER_SEQUENCE = 5
+
+
+def max_sequences_for(budget: TokenBudget) -> int:
+    """How many sequences could fit in the token budget in the best case."""
+    return budget.max_request_tokens // MIN_TOKENS_PER_SEQUENCE
+
+
 def encode_request(
     compiled: CompiledRequest, backend: Backend, budget: TokenBudget
 ) -> EncodedRequest:
@@ -256,8 +267,17 @@ def encode_request(
 
     Nothing is truncated: overflow is refused with 422 ``context_length_exceeded``
     (spec 6.3, ``overflow_policy: reject``).
+
+    The *count* of sequences is checked first, because it is known without tokenizing
+    anything. 256 questions x 255 options is 65,280 sequences, and short texts carry
+    that straight through the character ceiling, so the whole set used to be tokenized
+    and only then refused on a total it could never have met (S-L1).
     """
     flat: list[TextPair] = [pair for question in compiled.questions for pair in question.pairs]
+    if len(flat) > max_sequences_for(budget):
+        raise ContextLengthExceededError(
+            "The encoded request exceeds the per-request token limit."
+        )
     encoded = backend.count_and_encode(flat)
     if len(encoded) != len(flat):
         raise InferenceError("The backend returned a different number of encoded sequences.")

@@ -42,6 +42,15 @@ if (-not (Test-Path $modelDir)) {
     if ($LASTEXITCODE -ne 0) { throw "fetch-model failed with exit code $LASTEXITCODE" }
 }
 
+if ($ServerHost -notin @("127.0.0.1", "localhost", "::1")) {
+    Write-Host ""
+    Write-Host "WARNING: binding to $ServerHost exposes this server beyond the loopback interface." -ForegroundColor Red
+    Write-Host "  There is no TLS (README N21), so the Bearer key and every request body travel" -ForegroundColor Red
+    Write-Host "  in clear text, and there is no per-caller rate limit (N18). The PoC is meant to" -ForegroundColor Red
+    Write-Host "  be reached from this machine only; put a TLS terminator in front of it otherwise." -ForegroundColor Red
+    Write-Host ""
+}
+
 Write-Host "Starting JevBERT on http://${ServerHost}:${Port} (config: $Config)" -ForegroundColor Green
 Write-Host "  readiness: http://${ServerHost}:${Port}/readyz   (503 until the bundle has warmed up)"
 uv run python -m jevbert serve --config $Config --host $ServerHost --port $Port --log-level $LogLevel

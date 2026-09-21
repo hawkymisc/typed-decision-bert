@@ -226,6 +226,12 @@ def plan_microbatches(
     a batch of its own - refusing it here would be a 500 for something the request path
     already accepted, and looping on it would be worse.
 
+    ``longest x count`` is a memory model for scaled dot-product attention, which does
+    not materialise the ``length^2`` score matrix. It is not a safe budget for an eager
+    attention implementation, where a batch at the ceiling would allocate a temporary
+    proportional to ``count x heads x longest^2`` (S-L5). transformers picks sdpa for
+    this checkpoint; a build that forced eager would need this ceiling re-derived.
+
     Returns:
         Batches of ``(original index, length)``, every index exactly once.
     """

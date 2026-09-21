@@ -138,7 +138,7 @@ class TestSequenceAssembly:
     def test_a_repeated_premise_is_tokenized_once(
         self, nli_backend: NliZeroShotBackend
     ) -> None:
-        # backends/base.py SHOULD: one request can carry 8,160 copies of the state.
+        # backends/base.py SHOULD: one request can carry 65,280 copies of the state.
         before = nli_backend.premise_tokenizations
         pairs = [TextPair("同じ state", f"候補 {index}") for index in range(50)]
         nli_backend.count_and_encode(pairs)

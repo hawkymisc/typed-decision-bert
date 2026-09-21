@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 1.1.0（2026-09-21。フェーズ2.5の実測を §5.8〜§5.10 と第4章・第6章に追記した） |
+| 文書バージョン | 1.1.0（2026-09-21。フェーズ2.5の実測を §4.2・§4.4・§5.8〜§5.10・§6.1・§7.4 に追記した） |
 | 上位文書 | [仕様書 v0.3.0](../JevBERT_spec_design.md)、[POC_DESIGN v0.4.0](POC_DESIGN.md) |
 | 対象 | フェーズ2（実モデル backend の実機検証）とフェーズ2.5（レビュー指摘の反映）で得た**実測値** |
 | 計測日 | 2026-09-21 |
@@ -306,7 +306,13 @@ normalizer（`Precompiled` charsmap）を通すため、生の ASCII だけを�
 backend の共有をやめたあと、静止した作業ツリーで `uv run --no-sync pytest -q -m model` を 20 回連続実行した。
 
 ```text
-20 回 / 20 回とも 140 passed（1047 deselected）。失敗・エラーは 0。1 回あたり約 24 秒。
+run 1:  140 passed, 1047 deselected, 1 warning in 24.67s
+run 2:  140 passed, 1047 deselected, 1 warning in 24.17s
+...
+run 19: 140 passed, 1047 deselected, 1 warning in 24.56s
+run 20: 140 passed, 1047 deselected, 1 warning in 24.43s
+
+20 回 / 20 回とも 140 passed（1047 deselected）。失敗・エラーは 0。1 回あたり 24.1〜26.2 秒。
 ```
 
 （フェーズ2 の 59 件から 140 件に増えたのは、S-H1 の回帰表・fuzz・HTTP 試験と Q-M1 の順序試験を足したため。）
@@ -390,6 +396,8 @@ GET /readyz -> 200 {"status":"ready"}         # 重みの SHA-256 照合 + ロ�
 
 ### 7.2 公式 SDK からの応答（`scripts/sdk_demo.py`、抜粋）
 
+> フェーズ2（bundle `…-0.1.0`）の記録。新 bundle での再確認は §7.4。
+
 drop-in（`base_url` と `api_key` だけ差し替え、model は SDK 既定の `jev-latest`）:
 
 ```text
@@ -440,7 +448,59 @@ I01〜I09 はすべて OK（生出力は §7.3）。SDK 側では `legend` が `
   I09 no unspecified fields                                  OK
 ```
 
-### 7.4 構造化ログ（入力を含まないことの確認）
+### 7.4 フェーズ2.5：新 bundle での再確認（別ポート 8766 で起動）
+
+§7.2・§7.3 はフェーズ2（bundle `…-0.1.0`）の記録である。escape を作り直した新 bundle
+（`jevbert-poc-nli-ja-en-0.2.0`、digest `sha256:61dbb219…`）に対して同じ確認を行った。
+
+**AC2 の再実行**: `scripts/sdk_demo.py` の I01〜I09 はすべて OK。
+**応答の数値はフェーズ2 と 1 bit も変わらない**（`noul=0.6689449430817159`、
+`choice='billing' confidence=0.8044792449987631`、`score=1.9057055815509552`）。変わったのは `model` の値だけである。
+
+**S-H1 の再現と修正の確認**（同一 body を新旧サーバーへ送った生出力）:
+
+```text
+port 8765 (フェーズ2 のコードが稼働中)
+  HTTP 500  bundle=sha256:85cc98bff531a960c1226422edd3cd7828b30b5ccd46028c6d4ac49963d921f4
+  {"error": {"code": "inference_error", "message": "The model failed to encode the request.",
+   "retryable": false}, "request_id": "8b33a993cc8746a88dc66d41a8dc7a9e"}
+
+port 8766 (フェーズ2.5 のコード)
+  HTTP 200  bundle=sha256:61dbb2190c473fa8925a523e28f32a1ec83df1dcbb2f52f832fdbdea0cb1d494
+  {"model": "jevbert-poc-nli-ja-en-0.2.0",
+   "answers": {"q": {"type": "noul", "noul": 0.20971088915662617}},
+   "usage": {"input_tokens": 40, "output_tokens": 0}}
+```
+
+body は `{"model": "jev-latest", "state": "＜s＞ 返金してください。", "questions": {"q": {"type": "noul"}}}`。
+
+**state・instructions・criteria・候補キーのすべてに全角予約文字列を入れた要求も 200**:
+
+```text
+  -> HTTP 200
+  X-JevBERT-Bundle: sha256:61dbb2190c473fa8925a523e28f32a1ec83df1dcbb2f52f832fdbdea0cb1d494
+  "choice": "billing＜/s＞"
+  "probabilities": {"billing＜/s＞": 0.6648599953710604, "technical": 0.14057066797270393,
+                    "other": 0.1945693366562357}
+  "legend": {"0": "対応期限の指定がない ＜/s＞", "1": "数日以内", "2": "当日中 ＜mask＞"}
+  "usage": {"input_tokens": 605, "output_tokens": 0}
+```
+
+**候補キーも legend も、利用者が書いたまま返っている**（escape はモデル入力の直前にしか適用されない）。
+
+**レイテンシー再計測**（同条件・100 回、新 bundle）:
+
+```text
+Q=4 K=8 -> 32 sequences per request, 2096 input tokens (66 per sequence on average,
+           longest at most 209, limit 512)
+  p50_ms 32.5 / p95_ms 33.1 / p99_ms 33.4 / mean 32.5
+spec 14.3 target p95 <= 250 ms: MET (measured p95 33.1 ms)
+```
+
+第6章の 34.2 ms / 32.8 ms と合わせて 3 回目の計測であり、**いずれも実行間のばらつきの範囲**である。
+`longest at most 209` が §6.1 の上界である（平均 66 ではなくこちらを 512 と比べる）。
+
+### 7.5 構造化ログ（入力を含まないことの確認）
 
 ```json
 {"request_id":"5b79fc17...","method":"POST","path":"/v1/systemone","status":200,
@@ -458,12 +518,12 @@ state・instructions・criteria・候補キー・質問 ID・認証情報のい�
 
 | ID | 基準 | 状況 | 根拠 |
 | --- | --- | --- | --- |
-| AC1 | 実モデル backend でサーバーが起動し `/readyz` が 200 | **達成** | §7.1。`tests/integration/test_nli_model.py::TestSpecExampleOverHttp::test_readyz_is_two_hundred` |
-| AC2 | 公式 SDK から §5.6 の例を送り I01〜I09 を満たす応答を復元 | **達成** | §7.2・§7.3 |
+| AC1 | 実モデル backend でサーバーが起動し `/readyz` が 200 | **達成** | §7.1（新 bundle での再確認は §7.4）。`tests/integration/test_nli_model.py::TestSpecExampleOverHttp::test_readyz_is_two_hundred` |
+| AC2 | 公式 SDK から §5.6 の例を送り I01〜I09 を満たす応答を復元 | **達成** | §7.2・§7.3、新 bundle での再実行は §7.4 |
 | AC3 | 第8章のテスト一式が GREEN | **達成** | フェーズ2.5 時点で `1187 tests` 収集、`1186 passed, 1 skipped`（`model` マーカー 140 件を含む）。フェーズ2 時点は `941 tests` / `940 passed, 1 skipped`（`model` 59 件） |
 | AC4 | smoke 評価の結果が記録されている | **達成** | 第4章 |
 | AC5 | README に非機能要件ごとの充足・部分充足・未充足と根拠 | **達成** | [README](../README.md) の「非機能要件の充足状況」（充足 13 / 部分充足 2 / 未充足 8） |
-| AC6 | §14.3 の条件でのレイテンシー実測値が記録されている | **達成** | 第6章（p95 34.2 ms、目標達成） |
+| AC6 | §14.3 の条件でのレイテンシー実測値が記録されている | **達成** | 第6章（p95 34.2 ms、目標達成）。新 bundle での 3 回目は p95 33.1 ms（§7.4）。「各系列 512 token 以下」の確認方法は §6.1 で訂正した |
 
 ---
 

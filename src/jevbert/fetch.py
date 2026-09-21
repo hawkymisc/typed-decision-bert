@@ -27,14 +27,14 @@ from typing import Any
 
 from huggingface_hub import snapshot_download
 
-#: The zero-shot NLI model behind ``a0-nli-zeroshot-v1`` (spec 7.7, ADR-011). MIT
+#: The zero-shot NLI model behind ``a0-nli-zeroshot-v2`` (spec 7.7, ADR-011). MIT
 #: licensed, safetensors, no custom modelling code.
 REPO_ID = "MoritzLaurer/bge-m3-zeroshot-v2.0"
 
 #: Pinned commit. A tag or a branch would let the bytes move under a fixed bundle ID.
 REVISION = "9abf1c8aaeb82a2447809c20753ed0b106b76652"
 
-MANIFEST_FILENAME = "jevbert-poc-nli-ja-en-0.1.0.json"
+MANIFEST_FILENAME = "jevbert-poc-nli-ja-en-0.2.0.json"
 
 #: Exactly the files the backend opens, and nothing else. An allow-list rather than an
 #: ignore-list, so a file added to the repo later cannot arrive unnoticed.

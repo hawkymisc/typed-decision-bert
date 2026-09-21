@@ -1,4 +1,4 @@
-"""a0-nli-zeroshot-v1: a public zero-shot NLI classifier in the A0 shape (spec 7.7).
+"""a0-nli-zeroshot-v2: a public zero-shot NLI classifier in the A0 shape (spec 7.7).
 
 One sequence per candidate. The scalar the backend returns is the entailment log-odds
 
@@ -12,16 +12,23 @@ Two things here are load-bearing for safety rather than for quality:
 * **Control IDs are assembled, never parsed out of text** (spec 6.2, CT11). Premise and
   hypothesis are tokenized separately with ``add_special_tokens=False`` and the
   sequence is built as ``[bos] + premise + [eos, eos] + hypothesis + [eos]``. Whatever
-  the user wrote stays data.
+  the user wrote stays data. The escape that makes that true is decided on the
+  *normalized* text, because the tokenizer folds compatibility characters before it
+  matches its special tokens (S-H1, POC_DESIGN 12.4).
 * **Nothing is truncated** (spec 6.3). The token budget is enforced upstream and
   overflow is a 422, so a sequence that arrives here is one the server already accepted.
+
+The file hashes are verified at :meth:`NliZeroShotBackend.load` and the weights are read
+immediately afterwards. Nothing re-reads them, so a file replaced between the two steps
+would be loaded unverified: a TOCTOU window the PoC accepts because both steps run
+inside one startup on a single-user machine (S-L5, README N08).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -33,50 +40,152 @@ from jevbert.fetch import mismatched_files
 
 logger = logging.getLogger("jevbert.backend.nli")
 
-#: Special token strings that must never reach the tokenizer as data.
+#: Every special token string this build knows how to keep out of the data.
 #:
 #: ``split_special_tokens=True`` looks like the answer and is not: measured against this
 #: tokenizer it still produced six control IDs from user text (POC_DESIGN 12.3, K2).
-#: What does work is inserting a space after the leading ``<``, which the tokenizer then
-#: reads as ordinary characters. Lower case only - the tokenizer matches its special
-#: tokens case sensitively, so ``<MASK>`` is already just text.
+#: A checkpoint whose special tokens are not all in this list is refused at load time
+#: (A-M5): escaping is only as complete as this list.
 RESERVED_STRINGS: tuple[str, ...] = ("</s>", "<s>", "<pad>", "<unk>", "<mask>")
 
-#: Control tokens the compiler inserts, and the exact count every sequence must carry.
-_STRUCTURAL_TOKEN_COUNT = 4
+#: A tokenizer's normalizer, as a plain function of text.
+Normalize = Callable[[str], str]
 
 _ENTAILMENT_LABEL = "entailment"
 
 
-def escape_reserved(text: str) -> str:
-    """Disarm reserved special-token strings by putting a space after the ``<``.
+def normalizer_of(tokenizer: Any) -> Normalize:
+    """The tokenizer's own normalizer, as a function (S-H1).
 
-    ``"a<s>b</s>c"`` becomes ``"a< s>b< /s>c"``. Only spaces are inserted: nothing is
-    removed or reordered, so the text the model sees still contains everything the
-    caller wrote. That it is *not identical* to what the caller wrote is a recorded
-    difference (``compat/differences.md`` L08).
-
-    One left-to-right pass is enough, and terminates for the same reason: a ``<`` that
-    has been given a space can never start a reserved string again, and no ``<`` is
-    ever added. Scanning continues from the character after the disarmed ``<``, so a
-    nested ``"<<s>s>"`` is handled without a second pass.
+    Not ``unicodedata.normalize("NFKC", ...)``: the two disagree on 181 code points for
+    this checkpoint, and the disagreement is exactly where it hurts. The charsmap
+    *deletes* the C0 control characters, so ``"<\\x01s>"`` normalizes to ``"<s>"`` and
+    NFKC leaves it alone (POC_DESIGN 12.4). Matching the tokenizer means asking it.
     """
-    index = text.find("<")
-    if index < 0:
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    normalizer = getattr(backend, "normalizer", None)
+    if normalizer is None:
+        raise ValueError(
+            "the tokenizer exposes no normalizer, so the escape cannot be decided on "
+            "the text the tokenizer will actually match against"
+        )
+    normalize: Normalize = normalizer.normalize_str
+    return normalize
+
+
+def reserved_strings_for(tokenizer: Any) -> tuple[str, ...]:
+    """The checkpoint's special tokens, refusing any this build does not escape (A-M5).
+
+    ``RESERVED_STRINGS`` is a constant, and a constant that silently fails to cover a
+    checkpoint is worse than one that is missing: the escape would pass, the structural
+    check would fire, and every request carrying that token would be a 500. Refusing to
+    load makes it a readiness failure instead (spec 16.1).
+    """
+    declared = [str(token) for token in getattr(tokenizer, "all_special_tokens", ())]
+    unknown = sorted(set(declared) - set(RESERVED_STRINGS))
+    if unknown:
+        raise ValueError(
+            f"the checkpoint declares {len(unknown)} special token(s) this build does "
+            "not know how to escape; a0-nli-zeroshot-v2 escapes "
+            f"{', '.join(RESERVED_STRINGS)}"
+        )
+    if not declared:
+        raise ValueError("the checkpoint declares no special token to protect")
+    return tuple(declared)
+
+
+def escape_reserved(
+    text: str, normalize: Normalize, reserved: Sequence[str] = RESERVED_STRINGS
+) -> str:
+    """Disarm reserved strings, judged on the text the tokenizer will match against.
+
+    ``"a<s>b</s>c"`` becomes ``"a< s>b< /s>c"``, and so does its full-width spelling:
+    the decision is taken on ``normalize(text)``, so ``"\\uff1cs\\uff1e"`` - which folds
+    to ``"<s>"`` - is disarmed too. Only spaces are inserted, and they are inserted into
+    the caller's own characters, so the model still reads what the caller wrote
+    (``compat/differences.md`` L08).
+
+    Two stages, in this order:
+
+    1. If the normalized text spells no reserved string, return the text **unchanged**.
+       Ordinary prose containing ``"<"`` is therefore never rewritten.
+    2. Otherwise put a space after every character that normalizes into a ``"<"``. Every
+       ``"<"`` in the normalized output is then followed by a space, and no reserved
+       string begins with ``"<"`` followed by a space, so none can survive.
+
+    Locating the reserved string in the *original* text was tried and rejected: the
+    charsmap deletes 30 control characters, so ``"<"`` plus arbitrarily many of them
+    plus ``"s>"`` normalizes to ``"<s>"`` and no window of bounded width can see it
+    (POC_DESIGN 12.4).
+
+    The character-to-``"<"`` question is memoised for the length of one call only. The
+    memo is a table of characters, it never leaves the call, and nothing derived from
+    the caller's text outlives it (spec 15.2).
+    """
+    if not any(token in normalize(text) for token in reserved):
         return text
 
+    folds_to_angle: dict[str, bool] = {}
     parts: list[str] = []
-    start = 0
-    while index >= 0:
-        if any(text.startswith(token, index) for token in RESERVED_STRINGS):
-            parts.append(text[start : index + 1])
+    for character in text:
+        parts.append(character)
+        angle = folds_to_angle.get(character)
+        if angle is None:
+            angle = "<" in normalize(character)
+            folds_to_angle[character] = angle
+        if angle:
             parts.append(" ")
-            start = index + 1
-        index = text.find("<", index + 1)
-    if not parts:
-        return text
-    parts.append(text[start:])
     return "".join(parts)
+
+
+def escape_every_angle(text: str, normalize: Normalize) -> str:
+    """The stronger fallback: normalize the text, then space every ``"<"`` in it.
+
+    :func:`escape_reserved` has to know which characters fold into a ``"<"``; this one
+    does not, because it hands the tokenizer the normalizer's own output and edits that.
+    It changes the caller's text further - compatibility characters are folded away -
+    which is why it is a fallback and not the rule.
+    """
+    if "<" not in normalize(text):
+        return text
+    return normalize(text).replace("<", "< ")
+
+
+def misplaced_control_token(
+    ids: Sequence[int],
+    premise_length: int,
+    *,
+    bos_token_id: int,
+    eos_token_id: int,
+    control_ids: frozenset[int],
+) -> int | None:
+    """The first index holding a control token the assembly did not put there (S-H1).
+
+    ``[bos] premise [eos, eos] hypothesis [eos]``. Counting four control IDs is not
+    enough: a sequence in which a separator moved into the caller's data and one of the
+    caller's tokens took its place still carries four. The positions are known exactly -
+    this method chose them - so they are what is checked.
+
+    Returns:
+        The lowest index that violates the structure, or ``None`` when it is intact.
+    """
+    if len(ids) < premise_length + 4:
+        return len(ids)
+    separator = premise_length + 1
+    expected = {
+        0: bos_token_id,
+        separator: eos_token_id,
+        separator + 1: eos_token_id,
+        len(ids) - 1: eos_token_id,
+    }
+    for index, token_id in enumerate(ids):
+        wanted = expected.get(index)
+        if wanted is None:
+            if token_id in control_ids:
+                return index
+        elif token_id != wanted:
+            return index
+    return None
 
 
 def resolve_entailment_index(id2label: Mapping[int, str]) -> int:
@@ -88,7 +197,7 @@ def resolve_entailment_index(id2label: Mapping[int, str]) -> int:
     """
     if len(id2label) != 2:
         raise ValueError(
-            f"a0-nli-zeroshot-v1 needs a two-class NLI head, found {len(id2label)} labels. "
+            f"a0-nli-zeroshot-v2 needs a two-class NLI head, found {len(id2label)} labels. "
             "z = z_entailment - z_not_entailment is the log-odds of spec 7.7 only for two "
             "classes."
         )
@@ -185,7 +294,7 @@ class NliZeroShotBackend:
     (spec 15.3).
     """
 
-    backend_id = "a0-nli-zeroshot-v1"
+    backend_id = "a0-nli-zeroshot-v2"
 
     def __init__(
         self,
@@ -213,8 +322,11 @@ class NliZeroShotBackend:
         self._pad_token_id = 1
         self._bos_token_id = 0
         self._eos_token_id = 2
-        self._structural_ids: frozenset[int] = frozenset()
+        self._control_ids: frozenset[int] = frozenset()
+        self._normalize: Normalize | None = None
+        self._reserved: tuple[str, ...] = RESERVED_STRINGS
         self._premise_tokenizations = 0
+        self._fallback_escapes = 0
 
     @property
     def model_dir(self) -> Path:
@@ -238,11 +350,16 @@ class NliZeroShotBackend:
         """How many premise strings have been handed to the tokenizer.
 
         An observability counter for the SHOULD in ``backends/base.py``: one request can
-        carry 8,160 copies of the same state, and this is how a test sees that the state
+        carry 65,280 copies of the same state, and this is how a test sees that the state
         was tokenized once rather than once per candidate. It counts strings, never
         stores them.
         """
         return self._premise_tokenizations
+
+    @property
+    def fallback_escapes(self) -> int:
+        """How many pairs needed the stronger escape (S-H1). Counts pairs, not text."""
+        return self._fallback_escapes
 
     def load(self) -> None:
         """Verify the pinned files, then load the tokenizer and the weights.
@@ -268,6 +385,10 @@ class NliZeroShotBackend:
         tokenizer = AutoTokenizer.from_pretrained(
             self._model_dir, local_files_only=True, trust_remote_code=False, use_fast=True
         )
+        # Both before the weights: a checkpoint this build cannot escape safely must
+        # fail readiness, not 500 on the requests that happen to exercise it (A-M5).
+        self._normalize = normalizer_of(tokenizer)
+        self._reserved = reserved_strings_for(tokenizer)
         model = AutoModelForSequenceClassification.from_pretrained(
             self._model_dir,
             local_files_only=True,
@@ -286,20 +407,22 @@ class NliZeroShotBackend:
         self._eos_token_id = _required_token_id(tokenizer, "eos_token_id", "sep_token_id")
         self._pad_token_id = _required_token_id(tokenizer, "pad_token_id")
         # The unknown token is data, not structure: it stands for a character the
-        # vocabulary cannot encode, and counting it would turn an exotic but perfectly
-        # valid input into a 500.
-        self._structural_ids = frozenset(
+        # vocabulary cannot encode, and treating it as control would turn an exotic but
+        # perfectly valid input into a 500.
+        self._control_ids = frozenset(
             token_id
             for token_id in tokenizer.all_special_ids
             if token_id != tokenizer.unk_token_id
         )
         logger.info(
-            "backend %s loaded: device=%s dtype=%s entailment_index=%d labels=%d",
+            "backend %s loaded: device=%s dtype=%s entailment_index=%d labels=%d "
+            "reserved_strings=%d",
             self.backend_id,
             device,
             str(dtype).removeprefix("torch."),
             self._entailment_index,
             len(config.id2label),
+            len(self._reserved),
         )
 
     def count_and_encode(self, pairs: Sequence[TextPair]) -> list[EncodedSequence]:
@@ -307,7 +430,11 @@ class NliZeroShotBackend:
 
         Every distinct premise is tokenized once per call, as ``backends/base.py``
         requires: an A0 request repeats the same state for every candidate, so doing
-        otherwise would pay for the state up to 8,160 times. The map dies with the call.
+        otherwise would pay for the state up to 65,280 times. The map dies with the call.
+
+        A pair whose assembled sequence still carries a control token in a data position
+        is re-encoded with the stronger escape rather than refused: a caller's text must
+        not be able to turn a 200 into a 500 (S-H1).
         """
         tokenizer = self._require_tokenizer()
         if not pairs:
@@ -316,36 +443,81 @@ class NliZeroShotBackend:
         distinct_premises: dict[str, int] = {}
         for pair in pairs:
             distinct_premises.setdefault(pair.premise, len(distinct_premises))
-        premise_texts = [escape_reserved(text) for text in distinct_premises]
+        premise_texts = [self._escape(text) for text in distinct_premises]
         premise_ids = tokenizer(premise_texts, add_special_tokens=False)["input_ids"]
         self._premise_tokenizations += len(premise_texts)
 
         hypothesis_ids = tokenizer(
-            [escape_reserved(pair.hypothesis) for pair in pairs], add_special_tokens=False
+            [self._escape(pair.hypothesis) for pair in pairs], add_special_tokens=False
         )["input_ids"]
 
-        bos, eos = self._bos_token_id, self._eos_token_id
         sequences: list[EncodedSequence] = []
         for pair, hypothesis in zip(pairs, hypothesis_ids, strict=True):
             premise = premise_ids[distinct_premises[pair.premise]]
-            ids = [bos, *premise, eos, eos, *hypothesis, eos]
-            self._check_structural_tokens(ids)
+            ids = self._assemble(premise, hypothesis)
+            if misplaced_control_token(
+                ids,
+                len(premise),
+                bos_token_id=self._bos_token_id,
+                eos_token_id=self._eos_token_id,
+                control_ids=self._control_ids,
+            ) is not None:
+                ids = self._reencode(pair)
             sequences.append(EncodedSequence(token_count=len(ids), data=ids))
         return sequences
 
-    def _check_structural_tokens(self, ids: Sequence[int]) -> None:
-        """CT11: the four control IDs are the ones this method just inserted.
+    def _escape(self, text: str) -> str:
+        """The rule of POC_DESIGN 5.4, with this checkpoint's own normalizer."""
+        return escape_reserved(text, self._require_normalize(), self._reserved)
 
-        A reserved string in the state or in a criterion has to arrive as data. If the
-        escape ever stops working, the request must fail loudly rather than be scored
-        against a sequence whose structure the caller wrote.
+    def _escape_hard(self, text: str) -> str:
+        return escape_every_angle(text, self._require_normalize())
+
+    def _assemble(self, premise: Sequence[int], hypothesis: Sequence[int]) -> list[int]:
+        """XLM-RoBERTa's pair form, built from IDs rather than parsed out of text."""
+        bos, eos = self._bos_token_id, self._eos_token_id
+        return [bos, *premise, eos, eos, *hypothesis, eos]
+
+    def _reencode(self, pair: TextPair) -> list[int]:
+        """Second attempt at one pair, with the stronger escape (S-H1).
+
+        Reaching here means the targeted escape did not disarm something this
+        tokenizer still read as a control token. That is a defect in the escape, not in
+        the request, so it is logged for an operator - without any of the text - and the
+        pair is encoded again from the normalizer's own output. Only if *that* still
+        leaves a control token in a data position does the request fail, which is the
+        one case where a 500 is the honest answer.
         """
-        found = sum(1 for token_id in ids if token_id in self._structural_ids)
-        if found != _STRUCTURAL_TOKEN_COUNT:
+        tokenizer = self._require_tokenizer()
+        self._fallback_escapes += 1
+        logger.warning(
+            "backend %s: the targeted escape left a control token in a data position; "
+            "re-encoding the pair with the stronger escape",
+            self.backend_id,
+        )
+        premise = tokenizer(self._escape_hard(pair.premise), add_special_tokens=False)[
+            "input_ids"
+        ]
+        hypothesis = tokenizer(
+            self._escape_hard(pair.hypothesis), add_special_tokens=False
+        )["input_ids"]
+        self._premise_tokenizations += 1
+        ids = self._assemble(premise, hypothesis)
+        index = misplaced_control_token(
+            ids,
+            len(premise),
+            bos_token_id=self._bos_token_id,
+            eos_token_id=self._eos_token_id,
+            control_ids=self._control_ids,
+        )
+        if index is not None:
+            # Never scored: a sequence whose structure the caller wrote would make the
+            # answer a reply to a question this server did not ask (spec 6.2, CT11).
             raise ValueError(
-                f"the encoded sequence carries {found} control tokens, expected "
-                f"{_STRUCTURAL_TOKEN_COUNT}"
+                "the encoded sequence carries a control token in a data position that "
+                "neither escape could remove"
             )
+        return ids
 
     def score(self, sequences: Sequence[EncodedSequence], cancel: CancelToken) -> list[float]:
         """One finite entailment log-odds per sequence, in the order given."""
@@ -430,10 +602,15 @@ class NliZeroShotBackend:
                 f"{', '.join(sorted(bad))}"
             )
 
-    def _require_tokenizer(self) -> object:
+    def _require_tokenizer(self) -> Any:
         if self._tokenizer is None:
             raise RuntimeError("the NLI backend has not been loaded")
         return self._tokenizer
+
+    def _require_normalize(self) -> Normalize:
+        if self._normalize is None:
+            raise RuntimeError("the NLI backend has not been loaded")
+        return self._normalize
 
     def _require_model(self) -> object:
         if self._model is None:

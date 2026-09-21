@@ -1,8 +1,8 @@
 {
-  "public_id": "jevbert-poc-nli-ja-en-0.1.0",
+  "public_id": "jevbert-poc-nli-ja-en-0.2.0",
   "description": "P0.5 PoC bundle: a public zero-shot NLI classifier driven through the A0 candidate-per-sequence path (spec 7.7). Not a trained JevBERT model. Probabilities are uncalibrated and no quality gate has been run, so the answers must not be presented as evaluated judgements.",
   "release_date": "2026-09-21",
-  "backend": "a0-nli-zeroshot-v1",
+  "backend": "a0-nli-zeroshot-v2",
   "serializer_version": "serializer-nli-v1+nli-template-v1",
   "source_model": {
     "repo": "MoritzLaurer/bge-m3-zeroshot-v2.0",

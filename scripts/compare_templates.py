@@ -27,7 +27,7 @@ from jevbert.inference.registry import backend_context, build_backend, read_mani
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "smoke"
-MANIFEST = PROJECT_ROOT / "manifests" / "jevbert-poc-nli-ja-en-0.1.0.json"
+MANIFEST = PROJECT_ROOT / "manifests" / "jevbert-poc-nli-ja-en-0.2.0.json"
 
 
 def main(argv: list[str] | None = None) -> int:

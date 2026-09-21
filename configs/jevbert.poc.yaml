@@ -11,7 +11,7 @@ manifests_dir: ../manifests
 models_dir: ../models
 
 bundles:
-  - jevbert-poc-nli-ja-en-0.1.0.json
+  - jevbert-poc-nli-ja-en-0.2.0.json
 
 # The fake backend answers with hashes of its input. It stays out of any configuration
 # that is meant to serve real answers.
@@ -48,8 +48,8 @@ serving:
   # `model` is still the immutable bundle ID (D01), never the alias.
   allow_jev_aliases: true
   aliases:
-    jev-latest: jevbert-poc-nli-ja-en-0.1.0
-    jev-preview: jevbert-poc-nli-ja-en-0.1.0
+    jev-latest: jevbert-poc-nli-ja-en-0.2.0
+    jev-preview: jevbert-poc-nli-ja-en-0.2.0
 
 # ADR-016: an unknown top level field is ignored so that a caller written against Jev
 # is not refused for its shape. Set to `reject` to get the strict reading back.

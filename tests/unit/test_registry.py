@@ -114,9 +114,9 @@ class TestBackendFactory:
         assert isinstance(build_backend(manifest, _context(tmp_path)), FakeBackend)
 
     def test_unknown_backend_names_the_known_ones(self, tmp_path: Path) -> None:
-        path = write_manifest(tmp_path, "unknown.json", backend="a0-nli-zeroshot-v1")
+        path = write_manifest(tmp_path, "unknown.json", backend="a0-nli-zeroshot-v2")
         manifest, _ = read_manifest(path)
-        with pytest.raises(ConfigurationError, match="a0-nli-zeroshot-v1"):
+        with pytest.raises(ConfigurationError, match="a0-nli-zeroshot-v2"):
             build_backend(manifest, _context(tmp_path))
 
     def test_the_context_carries_the_serving_batch_settings(self) -> None:
@@ -382,7 +382,7 @@ class TestModelListing:
 
 
 class TestNliBackendFactory:
-    """a0-nli-zeroshot-v1 is built from the manifest alone (A-F5, spec 15.3)."""
+    """a0-nli-zeroshot-v2 is built from the manifest alone (A-F5, spec 15.3)."""
 
     def _manifest(self, **source_overrides: Any) -> BundleManifest:
         source = {
@@ -392,11 +392,11 @@ class TestNliBackendFactory:
         }
         source.update(source_overrides)
         payload = dict(RAW_MANIFEST)
-        payload.update(backend="a0-nli-zeroshot-v1", source_model=source)
+        payload.update(backend="a0-nli-zeroshot-v2", source_model=source)
         return BundleManifest.model_validate(payload)
 
     def test_the_backend_id_is_registered(self) -> None:
-        assert "a0-nli-zeroshot-v1" in _BACKEND_FACTORIES
+        assert "a0-nli-zeroshot-v2" in _BACKEND_FACTORIES
 
     def test_the_model_directory_comes_from_the_manifest_repo(self, tmp_path: Path) -> None:
         backend = build_backend(self._manifest(), _context(tmp_path))
@@ -405,7 +405,7 @@ class TestNliBackendFactory:
 
     def test_a_manifest_without_a_source_model_refuses_startup(self, tmp_path: Path) -> None:
         payload = dict(RAW_MANIFEST)
-        payload.update(backend="a0-nli-zeroshot-v1", source_model=None)
+        payload.update(backend="a0-nli-zeroshot-v2", source_model=None)
         manifest = BundleManifest.model_validate(payload)
         with pytest.raises(ConfigurationError, match="source_model"):
             build_backend(manifest, _context(tmp_path))

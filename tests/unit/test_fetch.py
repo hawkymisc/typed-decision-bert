@@ -32,10 +32,10 @@ from jevbert.fetch import (
 from jevbert.inference.registry import read_manifest
 
 MANIFEST_TEMPLATE: dict[str, Any] = {
-    "public_id": "jevbert-poc-nli-ja-en-0.1.0",
+    "public_id": "jevbert-poc-nli-ja-en-0.2.0",
     "description": "test manifest",
     "release_date": "2026-09-21",
-    "backend": "a0-nli-zeroshot-v1",
+    "backend": "a0-nli-zeroshot-v2",
     "serializer_version": "serializer-nli-v1+nli-template-v1",
     "source_model": {"repo": REPO_ID, "revision": REVISION, "files": {}},
     "calibration": {

@@ -62,6 +62,9 @@ class TestPT03Agreement:
                 "state": "s",
                 "questions": {"q": {"type": "noul", "criteria": {"true": "t"}}},
             },
+            # ADR-016: appendix A now says additionalProperties: true at the top level,
+            # and the validator's default agrees by ignoring the field.
+            {"model": "m", "state": "s", "questions": {"q": {"type": "noul"}}, "extra": 1},
         ],
     )
     def test_known_valid_bodies(self, value: Any) -> None:
@@ -101,12 +104,25 @@ class TestPT03Agreement:
                 "state": "s",
                 "questions": {"q": {"type": "noul", "criteria": {"maybe": "m"}}},
             },
-            {"model": "m", "state": "s", "questions": {"q": {"type": "noul"}}, "extra": 1},
         ],
     )
     def test_known_invalid_bodies(self, value: Any) -> None:
         assert not accepted_by_schema(value)
         assert not accepted_by_validator(value)
+
+    def test_the_reject_setting_is_deliberately_stricter_than_the_schema(self) -> None:
+        """The published schema describes the default; ``reject`` narrows it.
+
+        Appendix A is the contract a caller codes against, so it has to describe what
+        the server accepts out of the box. An operator who turns on ``reject`` is
+        choosing to accept less than the published contract, which is the one direction
+        that cannot surprise a caller into sending something valid and being refused
+        without the operator having asked for it.
+        """
+        body = {"model": "m", "state": "s", "questions": {"q": {"type": "noul"}}, "extra": 1}
+        assert accepted_by_schema(body)
+        with pytest.raises(ValidationError):
+            validate_request(body, LIMITS, unknown_top_level_fields="reject")
 
 
 class TestBoundaryAgreement:
@@ -130,7 +146,7 @@ class TestBoundaryAgreement:
         }
         assert accepted_by_schema(body) == accepted_by_validator(body)
 
-    @pytest.mark.parametrize("count", [1, 32, 33])
+    @pytest.mark.parametrize("count", [1, 256, 257])
     def test_question_counts(self, count: int) -> None:
         body = {
             "model": "m",

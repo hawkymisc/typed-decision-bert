@@ -213,7 +213,7 @@ class TestLimits:
         limits = Limits()
         assert limits.max_body_bytes == 2_097_152
         assert limits.max_json_depth == 32
-        assert limits.max_questions == 32
+        assert limits.max_questions == 256
         assert (limits.min_choice_options, limits.max_choice_options) == (2, 255)
         assert (limits.min_score_levels, limits.max_score_levels) == (2, 10)
         assert limits.overflow_policy == "reject"

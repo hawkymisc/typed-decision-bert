@@ -8,10 +8,13 @@ a boolean never becomes a number and a number never becomes a string.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from jevbert.api.errors import ErrorPath, ValidationError
 from jevbert.config import Limits
+
+#: What to do with a top level field the contract does not define (spec 5.3, ADR-016).
+UnknownTopLevelPolicy = Literal["ignore", "reject"]
 
 #: ``Content`` and ``Entry`` from spec 5.2.
 Content = str | list[Any] | dict[str, Any]
@@ -61,17 +64,30 @@ class ValidatedRequest:
     questions: tuple[Question, ...]
 
 
-def validate_request(value: Any, limits: Limits) -> ValidatedRequest:
-    """Validate a parsed body, raising ``ValidationError`` on the first violation."""
+def validate_request(
+    value: Any,
+    limits: Limits,
+    *,
+    unknown_top_level_fields: UnknownTopLevelPolicy = "ignore",
+) -> ValidatedRequest:
+    """Validate a parsed body, raising ``ValidationError`` on the first violation.
+
+    An unknown *top level* field is ignored by default (ADR-016): the official SDK can
+    send one through ``extra_body``, and what the real Jev does with it is not knowable
+    from the published material, so refusing would break a caller that works today.
+    Ignored means ignored - it never reaches the model input or the response - and an
+    operator who would rather catch the typo sets ``reject``.
+    """
     if not isinstance(value, dict):
         raise ValidationError("The request body must be a JSON object.", path=[])
 
     for field in _TOP_LEVEL_FIELDS:
         if field not in value:
             raise ValidationError(f"`{field}` is required.", path=[field])
-    for field in value:
-        if field not in _TOP_LEVEL_FIELDS:
-            raise ValidationError(f"Unknown field `{field}`.", path=[field])
+    if unknown_top_level_fields == "reject":
+        for field in value:
+            if field not in _TOP_LEVEL_FIELDS:
+                raise ValidationError(f"Unknown field `{field}`.", path=[field])
 
     model = value["model"]
     if not isinstance(model, str) or not model:
@@ -100,6 +116,23 @@ def validate_request(value: Any, limits: Limits) -> ValidatedRequest:
 
 
 def _validate_question(question_id: str, raw: Any, limits: Limits) -> Question:
+    """Validate one question, tagging every failure inside it with its type.
+
+    The tag is what spec 5.9 puts after the question ID in ``detail[].loc``, and it is
+    attached here rather than at each ``raise`` so that a new check cannot forget it.
+    Nothing is swallowed: the same exception continues on its way.
+    """
+    try:
+        return _validate_typed_question(question_id, raw, limits)
+    except ValidationError as error:
+        if error.question_type is None and isinstance(raw, dict):
+            declared = raw.get("type")
+            if declared in QUESTION_TYPES:
+                error.question_type = declared
+        raise
+
+
+def _validate_typed_question(question_id: str, raw: Any, limits: Limits) -> Question:
     base: ErrorPath = ["questions", question_id]
     if not isinstance(raw, dict):
         raise ValidationError("A question must be an object.", path=base)

@@ -17,7 +17,7 @@
     "answers": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 32,
+      "maxProperties": 256,
       "additionalProperties": {
         "$ref": "#/$defs/Answer"
       }

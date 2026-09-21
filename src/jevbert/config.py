@@ -39,7 +39,10 @@ class Limits(_Strict):
 
     max_body_bytes: int = Field(default=2_097_152, gt=0)
     max_json_depth: int = Field(default=32, gt=0)
-    max_questions: int = Field(default=32, gt=0)
+    #: spec 4.2: Jev documents no question-count ceiling, only a token budget, so this
+    #: is set high enough that a request Jev would take is not refused for its count
+    #: alone (ADR-016). What actually bounds a request is ``max_request_tokens``.
+    max_questions: int = Field(default=256, gt=0)
     min_choice_options: int = Field(default=2, ge=2)
     max_choice_options: int = Field(default=255, le=255)
     min_score_levels: int = Field(default=2, ge=2)
@@ -63,6 +66,18 @@ class Limits(_Strict):
         if self.max_request_chars is not None:
             return self.max_request_chars
         return self.CHARS_PER_TOKEN * self.max_request_tokens
+
+
+class CompatSettings(_Strict):
+    """How far to go to accept a request the real Jev would accept (ADR-016).
+
+    ``ignore`` is the default because the official SDK ships ``extra_body``, whose
+    documented example is a field the API reference does not define, and refusing one
+    would break a caller that works against Jev. ``reject`` restores the strict
+    reading for an operator who would rather catch a typo than accept a future field.
+    """
+
+    unknown_top_level_fields: Literal["ignore", "reject"] = "ignore"
 
 
 class ServingSettings(_Strict):
@@ -95,6 +110,7 @@ class Settings(_Strict):
     enable_fake_bundle: bool = False
     limits: Limits = Field(default_factory=Limits)
     serving: ServingSettings = Field(default_factory=ServingSettings)
+    compat: CompatSettings = Field(default_factory=CompatSettings)
     #: ``repr=False`` so that no diagnostic, traceback or log line that happens to
     #: render the settings can print a credential (S-L3, spec 15.2). The keys are
     #: checked by :func:`validate_api_keys` rather than by a pydantic validator,

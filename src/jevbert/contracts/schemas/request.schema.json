@@ -3,7 +3,7 @@
   "$id": "urn:jevbert:request:jevbert-core-2026-09-21",
   "title": "JevBERT SystemOne Request",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "model",
     "state",
@@ -20,7 +20,7 @@
     "questions": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 32,
+      "maxProperties": 256,
       "additionalProperties": {
         "$ref": "#/$defs/Question"
       }

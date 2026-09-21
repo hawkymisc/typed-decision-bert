@@ -162,9 +162,20 @@ class TestSyncErrors:
                 client.system_one(state="s", questions={"q": Noul()})
         assert excinfo.value.status == 422
 
-    def test_extra_body_unknown_field_is_rejected(self, server_url: str) -> None:
-        # spec 3.4: extra_body merges into the top level body, which is a 422 here.
+    def test_extra_body_unknown_field_is_accepted_by_default(self, server_url: str) -> None:
+        # spec 3.4 / ADR-016: extra_body merges into the top level body, and an unknown
+        # top level field is ignored by default rather than refused, because a caller
+        # that works against Jev must keep working here.
         with client_for(server_url) as client:
+            answer = client.system_one(
+                state="s", questions={"q": Noul()}, extra_body={"temperature": 0.5}
+            )
+        assert set(answer.answers) == {"q"}
+
+    def test_extra_body_unknown_field_is_refused_when_configured(
+        self, strict_server_url: str
+    ) -> None:
+        with client_for(strict_server_url) as client:
             with pytest.raises(TypeSafeUnprocessableEntityError):
                 client.system_one(
                     state="s", questions={"q": Noul()}, extra_body={"temperature": 0.5}
@@ -309,3 +320,64 @@ class TestStrictValidationObservations:
         # ValidationError naming the field - not just "some exception happened".
         assert excinfo.value.error_count() == 1
         assert excinfo.value.errors()[0]["loc"] == ("noul",)
+
+
+class TestJevCompatibilityOverTheSocket:
+    """ADR-016: what a caller written against Jev sees when it is pointed here."""
+
+    def test_the_sdk_default_model_resolves_through_the_alias(
+        self, alias_server_url: str
+    ) -> None:
+        """The drop-in case (C2, spec 18.3): only base_url and api_key change.
+
+        ``TypeSafeClient`` defaults ``model`` to ``jev-latest``, so a caller that never
+        names a model is the caller most likely to be pointed at this server unchanged.
+        """
+        with TypeSafeClient(
+            base_url=alias_server_url, api_key=API_KEY, retry=NO_RETRY
+        ) as client:
+            response = client.system_one(state="s", questions={"q": Noul()})
+        # D01: the answer names the immutable bundle, never the alias that was asked for.
+        assert response.model == MODEL
+        assert isinstance(response.answers["q"], NoulAnswer)
+
+    def test_the_preview_alias_resolves_too(self, alias_server_url: str) -> None:
+        with TypeSafeClient(
+            base_url=alias_server_url, api_key=API_KEY, model="jev-preview", retry=NO_RETRY
+        ) as client:
+            assert client.system_one(state="s", questions={"q": Noul()}).model == MODEL
+
+    def test_a_422_body_carries_jev_s_detail_array(self, server_url: str) -> None:
+        with client_for(server_url) as client:
+            with pytest.raises(TypeSafeUnprocessableEntityError) as excinfo:
+                client.system_one(
+                    state="s", questions={"urgency": Score(criteria=["only one"])}
+                )
+        body = excinfo.value.body
+        assert body["detail"][0]["loc"][0] == "body"
+        # spec 3.4: Jev's own example puts the question type after the question ID.
+        assert body["detail"][0]["loc"] == ["body", "questions", "urgency", "score", "criteria"]
+        assert body["detail"][0]["type"] == "validation_error"
+
+    def test_the_detail_array_does_not_change_the_exception_message(
+        self, server_url: str
+    ) -> None:
+        # spec 5.9: the SDK extracts error.message first, so adding `detail` must not
+        # move the message a caller already logs.
+        with client_for(server_url) as client:
+            with pytest.raises(TypeSafeUnprocessableEntityError) as excinfo:
+                client.system_one(
+                    state="s", questions={"urgency": Score(criteria=["only one"])}
+                )
+        # The SDK frames the message it extracted; what matters is that the text it
+        # extracted is error.message and not something from the new `detail` array.
+        assert excinfo.value.body["error"]["message"] in str(excinfo.value)
+        assert "levels" in str(excinfo.value)
+
+    def test_many_questions_are_accepted(self, server_url: str) -> None:
+        # spec 4.2: 256, up from 32, so a count Jev would take is not refused here.
+        with client_for(server_url) as client:
+            response = client.system_one(
+                state="s", questions={f"q{index}": Noul() for index in range(256)}
+            )
+        assert len(response.answers) == 256

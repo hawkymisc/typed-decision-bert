@@ -32,6 +32,11 @@ from jevbert.backends.fake import FakeBackend
 from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.compiler.compiled import TokenBudget
 from jevbert.compiler.normalize import canonical_json
+from jevbert.compiler.serializer_nli import (
+    NLI_TEMPLATE_ID,
+    SERIALIZER_VERSION_FULL,
+    template_id_of,
+)
 from jevbert.config import ConfigurationError, Settings
 from jevbert.fetch import model_directory
 
@@ -421,6 +426,20 @@ def _check_manifest_against_limits(manifest: BundleManifest, settings: Settings)
             f"{manifest.public_id}: max_sequence_tokens="
             f"{manifest.limits.max_sequence_tokens} exceeds "
             f"model_max_sequence_tokens={model_limit}."
+        )
+    declared_template = template_id_of(manifest.serializer_version)
+    if declared_template is None:
+        raise ConfigurationError(
+            f"{manifest.public_id}: serializer_version={manifest.serializer_version!r} "
+            f"does not name a template. Expected {SERIALIZER_VERSION_FULL!r}."
+        )
+    if declared_template != NLI_TEMPLATE_ID:
+        # The template decides every compiled model input, so a manifest that names a
+        # different one is promising answers this build cannot produce. Refusing to
+        # start is the only way the bundle ID keeps meaning what it says (spec 5.7).
+        raise ConfigurationError(
+            f"{manifest.public_id}: the manifest names template {declared_template!r} "
+            f"but this build compiles with {NLI_TEMPLATE_ID!r}."
         )
     if manifest.confidence != "normalized-entropy-v1":
         raise ConfigurationError(

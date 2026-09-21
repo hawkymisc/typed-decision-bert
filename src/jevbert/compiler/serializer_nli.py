@@ -7,7 +7,7 @@ a real tokenizer without knowing either.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,15 +32,104 @@ from jevbert.contracts.validator import (
 from jevbert.scoring.numeric import NOUL_OPTION_ORDER
 
 SERIALIZER_VERSION = "serializer-nli-v1"
-NLI_TEMPLATE_ID = "nli-template-v1"
 
 #: Generic yes/no candidate text used when a Noul criterion is absent or null (spec 5.4).
 DEFAULT_NOUL_TRUE = "The answer to the question is yes."
 DEFAULT_NOUL_FALSE = "The answer to the question is no."
 
+#: Hiragana, katakana and CJK ideographs. Used by ``nli-template-v3`` only.
+_JAPANESE_RANGES = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
+
+
+def _looks_japanese(text: str) -> bool:
+    return any(
+        any(low <= ord(character) <= high for low, high in _JAPANESE_RANGES)
+        for character in text
+    )
+
+
+@dataclass(frozen=True)
+class HypothesisTemplate:
+    """How an instruction and a candidate become one NLI hypothesis (POC_DESIGN 5.3).
+
+    The three candidates below are the ones K4 compared; the bundle's
+    ``serializer_version`` names the one in force and the registry refuses a manifest
+    that names another, so the template a bundle ID promises is the template it gets.
+
+    User text is concatenated, never passed through ``str.format``: a criterion that
+    renders to ``"{}"`` - which an empty JSON object does - would otherwise be read as
+    a field reference.
+    """
+
+    template_id: str
+    render: Callable[[str | None, str], str]
+
+
+def _render_separator(instruction: str | None, candidate: str) -> str:
+    """nli-template-v1: ``"{I} — {C}"``, or the bare candidate without an instruction."""
+    if instruction is None:
+        return candidate
+    return f"{instruction} — {candidate}"
+
+
+def _render_question_answer(instruction: str | None, candidate: str) -> str:
+    """nli-template-v2: ``"Question: {I} Answer: {C}"``."""
+    if instruction is None:
+        return f"Answer: {candidate}"
+    return f"Question: {instruction} Answer: {candidate}"
+
+
+def _render_natural_sentence(instruction: str | None, candidate: str) -> str:
+    """nli-template-v3: a full sentence, in the script the question is written in.
+
+    The frame has to agree with the surrounding text or the hypothesis reads as two
+    languages spliced together, so the script of the instruction and the candidate
+    decides it. The rule is a character-range test, not a language model: it is
+    deterministic, it cannot fail, and it makes the compiled input depend on the
+    *script* of the input, which is itself a reason to prefer a frame that needs no
+    such rule (recorded with the K4 comparison in POC_RESULTS).
+    """
+    japanese = _looks_japanese(candidate) or (
+        instruction is not None and _looks_japanese(instruction)
+    )
+    if instruction is None:
+        return f"答えは「{candidate}」である。" if japanese else f'The answer is "{candidate}".'
+    if japanese:
+        return f"「{instruction}」の答えは「{candidate}」である。"
+    return f'The answer to "{instruction}" is "{candidate}".'
+
+
+TEMPLATE_V1 = HypothesisTemplate("nli-template-v1", _render_separator)
+TEMPLATE_V2 = HypothesisTemplate("nli-template-v2", _render_question_answer)
+TEMPLATE_V3 = HypothesisTemplate("nli-template-v3", _render_natural_sentence)
+
+#: The K4 candidates, by ID. ``scripts/compare_templates.py`` re-runs the comparison.
+TEMPLATES: dict[str, HypothesisTemplate] = {
+    template.template_id: template for template in (TEMPLATE_V1, TEMPLATE_V2, TEMPLATE_V3)
+}
+
+#: The template this build compiles with. Changing it changes every compiled input, so
+#: it also changes ``serializer_version`` and therefore the bundle ID (spec 5.7).
+DEFAULT_TEMPLATE = TEMPLATE_V1
+NLI_TEMPLATE_ID = DEFAULT_TEMPLATE.template_id
+
+#: What a manifest's ``serializer_version`` looks like for this build.
+SERIALIZER_VERSION_FULL = f"{SERIALIZER_VERSION}+{NLI_TEMPLATE_ID}"
+
+
+def template_id_of(serializer_version: str) -> str | None:
+    """The template ID a ``serializer_version`` names, or ``None`` if it names none."""
+    family, separator, template = serializer_version.partition("+")
+    if family != SERIALIZER_VERSION or not separator:
+        return None
+    return template
+
 
 def compile_request(
-    request: ValidatedRequest, *, max_request_chars: int | None = None
+    request: ValidatedRequest,
+    *,
+    max_request_chars: int | None = None,
+    template: HypothesisTemplate = DEFAULT_TEMPLATE,
 ) -> CompiledRequest:
     """Expand every question into one (premise, hypothesis) pair per candidate.
 
@@ -56,7 +145,7 @@ def compile_request(
         _check_request_chars(premise, prepared, max_request_chars)
     return CompiledRequest(
         model=request.model,
-        questions=tuple(_expand(question, premise) for question in prepared),
+        questions=tuple(_expand(question, premise, template) for question in prepared),
     )
 
 
@@ -132,9 +221,11 @@ def _prepare_question(question: Question) -> _PreparedQuestion:
     )
 
 
-def _expand(question: _PreparedQuestion, premise: str) -> CompiledQuestion:
+def _expand(
+    question: _PreparedQuestion, premise: str, template: HypothesisTemplate
+) -> CompiledQuestion:
     pairs = tuple(
-        TextPair(premise=premise, hypothesis=_hypothesis(question.instruction, candidate))
+        TextPair(premise=premise, hypothesis=template.render(question.instruction, candidate))
         for candidate in question.candidates
     )
     return CompiledQuestion(
@@ -156,13 +247,6 @@ def _choice_candidate(key: str, description: Entry) -> str:
     if description is None:
         return key
     return f"{key}: {render(description)}"
-
-
-def _hypothesis(instruction: str | None, candidate: str) -> str:
-    """Template ``nli-template-v1`` (POC_DESIGN 5.3)."""
-    if instruction is None:
-        return candidate
-    return f"{instruction} — {candidate}"
 
 
 def encode_request(
@@ -206,13 +290,16 @@ def compile_and_encode(
     budget: TokenBudget,
     *,
     max_request_chars: int,
+    template: HypothesisTemplate = DEFAULT_TEMPLATE,
 ) -> EncodedRequest:
     """Compile and tokenize one request.
 
     Called as a unit on the engine's encoder thread so that neither step runs on the
     event loop and both are covered by the request deadline (S-H2, A-F7).
     """
-    compiled = compile_request(request, max_request_chars=max_request_chars)
+    compiled = compile_request(
+        request, max_request_chars=max_request_chars, template=template
+    )
     return encode_request(compiled, backend, budget)
 
 

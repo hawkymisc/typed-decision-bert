@@ -21,6 +21,9 @@ logger = logging.getLogger("jevbert.api")
 #: Path elements are object keys (str) or array indices (int).
 ErrorPath = list[str | int]
 
+#: Question types, for the ``loc`` tag Jev's 422 schema puts after the question ID.
+_QUESTION_TYPE_TAGS = frozenset({"noul", "choice", "score"})
+
 
 class JevBERTError(Exception):
     """Base class for every failure with a defined HTTP contract."""
@@ -30,17 +33,57 @@ class JevBERTError(Exception):
     retryable: bool = False
     retry_after: int | None = None
 
-    def __init__(self, message: str, *, path: ErrorPath | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: ErrorPath | None = None,
+        question_type: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.path = path
+        #: Only set once the question's type has been established, because the tag in
+        #: ``detail[].loc`` must not be guessed (spec 5.9).
+        self.question_type = question_type
 
     def body(self, request_id: str) -> dict[str, Any]:
         error: dict[str, Any] = {"code": self.code, "message": self.message}
         if self.path is not None:
             error["path"] = self.path
         error["retryable"] = self.retryable
-        return {"error": error, "request_id": request_id}
+        payload: dict[str, Any] = {"error": error}
+        if self.status_code == 422:
+            payload["detail"] = self.detail()
+        payload["request_id"] = request_id
+        return payload
+
+    def detail(self) -> list[dict[str, Any]]:
+        """Jev's 422 shape, alongside JevBERT's own ``error`` object (spec 5.9, 3.4).
+
+        The official SDK's wire schema - generated from Jev's OpenAPI document -
+        defines a 422 as ``{"detail":[{"loc","msg","type"}]}``, so a client that reads
+        ``detail`` directly keeps working against this server. ``input`` and ``ctx``
+        are part of that schema and are deliberately left out: both carry the caller's
+        own value back out in an error body (spec 15.2).
+        """
+        return [{"loc": self.detail_loc(), "msg": self.message, "type": self.code}]
+
+    def detail_loc(self) -> list[str | int]:
+        """``["body"] + path``, with the question type inserted after the question ID.
+
+        The tag is only inserted when the path reaches *inside* a question and the type
+        was actually determined; a question whose ``type`` is the thing being rejected
+        has no type to name.
+        """
+        path = list(self.path or [])
+        if (
+            len(path) > 2
+            and path[0] == "questions"
+            and self.question_type in _QUESTION_TYPE_TAGS
+        ):
+            return ["body", path[0], path[1], self.question_type, *path[2:]]
+        return ["body", *path]
 
     def headers(self) -> dict[str, str]:
         if self.retry_after is None:

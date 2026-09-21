@@ -12,6 +12,7 @@ from jevbert.api.errors import ModelNotFoundError
 from jevbert.backends.base import Backend, CancelToken, EncodedSequence, TextPair
 from jevbert.backends.fake import FakeBackend
 from jevbert.backends.nli import NliZeroShotBackend
+from jevbert.compiler.serializer_nli import NLI_TEMPLATE_ID, template_id_of
 from jevbert.config import ConfigurationError, Limits, ServingSettings
 from jevbert.fetch import model_directory
 from jevbert.inference.registry import (
@@ -414,3 +415,36 @@ class TestNliBackendFactory:
         # promise an identity the loaded bytes never had to match (spec 5.7, 15.3).
         with pytest.raises(ConfigurationError, match="fetch-model"):
             build_backend(self._manifest(files={}), _context(tmp_path))
+
+
+class TestSerializerVersionNamesTheTemplate:
+    """spec 5.7: the bundle ID identifies the serializer, template included."""
+
+    def _settings(self, tmp_path: Path) -> Any:
+        return build_settings(manifests_dir=tmp_path, enable_fake_bundle=True)
+
+    def test_the_shipped_manifests_name_this_build_s_template(self) -> None:
+        manifest, _ = read_manifest(FAKE_MANIFEST)
+        assert template_id_of(manifest.serializer_version) == NLI_TEMPLATE_ID
+
+    def test_a_serializer_version_without_a_template_refuses_startup(
+        self, tmp_path: Path
+    ) -> None:
+        write_manifest(tmp_path, "jevbert-fake-0.0.0.json", serializer_version="serializer-nli-v1")
+        with pytest.raises(ConfigurationError, match="does not name a template"):
+            build_registry(self._settings(tmp_path))
+
+    def test_a_manifest_naming_another_template_refuses_startup(self, tmp_path: Path) -> None:
+        # The template decides every compiled input, so serving one while promising the
+        # other would make the bundle digest a claim the answers do not honour.
+        write_manifest(
+            tmp_path,
+            "jevbert-fake-0.0.0.json",
+            serializer_version="serializer-nli-v1+nli-template-v9",
+        )
+        with pytest.raises(ConfigurationError, match="nli-template-v9"):
+            build_registry(self._settings(tmp_path))
+
+    def test_changing_the_template_changes_the_digest(self) -> None:
+        changed = dict(RAW_MANIFEST, serializer_version="serializer-nli-v1+nli-template-v2")
+        assert bundle_digest(changed) != bundle_digest(RAW_MANIFEST)

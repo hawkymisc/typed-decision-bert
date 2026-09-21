@@ -50,12 +50,11 @@ class TestTopLevel:
             _validate(body)
         assert excinfo.value.path == [missing]
 
-    def test_unknown_top_level_field_is_rejected(self) -> None:
-        # spec 5.3 / SDK extra_body.
+    def test_unknown_top_level_field_is_ignored_by_default(self) -> None:
+        # spec 5.3 / SDK extra_body: ignoring is the default (ADR-016), and rejecting
+        # is a setting. Both, and what "ignored" has to mean, are in test_compat.py.
         body = _request(q={"type": "noul"}) | {"temperature": 0.5}
-        with pytest.raises(ValidationError) as excinfo:
-            _validate(body)
-        assert excinfo.value.path == ["temperature"]
+        assert len(_validate(body).questions) == 1
 
     @pytest.mark.parametrize("value", ["", 1, None, [], {}])
     def test_model_must_be_a_non_empty_string(self, value: Any) -> None:
@@ -90,12 +89,12 @@ class TestQuestionCount:
         with pytest.raises(ValidationError):
             _validate(_request())
 
-    def test_thirty_two_questions_are_accepted(self) -> None:
-        body = _request(**{f"q{i}": {"type": "noul"} for i in range(32)})
-        assert len(_validate(body).questions) == 32
+    def test_the_maximum_question_count_is_accepted(self) -> None:
+        body = _request(**{f"q{i}": {"type": "noul"} for i in range(256)})
+        assert len(_validate(body).questions) == 256
 
-    def test_thirty_three_questions_are_rejected(self) -> None:
-        body = _request(**{f"q{i}": {"type": "noul"} for i in range(33)})
+    def test_one_question_past_the_maximum_is_rejected(self) -> None:
+        body = _request(**{f"q{i}": {"type": "noul"} for i in range(257)})
         with pytest.raises(ValidationError) as excinfo:
             _validate(body)
         assert excinfo.value.path == ["questions"]

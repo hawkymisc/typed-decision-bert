@@ -3,7 +3,7 @@
   "description": "Deterministic fake bundle. Hashes its input instead of running a model; answers carry no meaning and must never be presented as model output.",
   "release_date": "2026-09-21",
   "backend": "fake-deterministic-v1",
-  "serializer_version": "serializer-nli-v1",
+  "serializer_version": "serializer-nli-v1+nli-template-v1",
   "source_model": null,
   "calibration": {
     "state": "uncalibrated",

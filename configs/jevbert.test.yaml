@@ -12,7 +12,7 @@ enable_fake_bundle: true
 limits:
   max_body_bytes: 2097152
   max_json_depth: 32
-  max_questions: 32
+  max_questions: 256
   min_choice_options: 2
   max_choice_options: 255
   min_score_levels: 2

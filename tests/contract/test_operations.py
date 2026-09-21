@@ -217,7 +217,7 @@ class TestCapabilities:
         configured = build_settings().limits
         assert limits["max_body_bytes"] == configured.max_body_bytes == 2_097_152
         assert limits["max_json_depth"] == configured.max_json_depth == 32
-        assert limits["max_questions"] == configured.max_questions == 32
+        assert limits["max_questions"] == configured.max_questions == 256
         assert limits["min_choice_options"] == 2
         assert limits["max_choice_options"] == 255
         assert limits["min_score_levels"] == 2
@@ -278,8 +278,13 @@ class TestFakeInjectionIsUnreachable:
                 Settings(api_keys=(API_KEY,), **{field: 5})
 
     def test_a_request_body_cannot_carry_them(self, client: TestClient) -> None:
+        # An unknown top level field is ignored rather than refused now (ADR-016), so
+        # what matters is that it changes nothing: the answer is the one the same body
+        # produces without it.
         body = request_body(NOUL) | {"logit_fn": "anything"}
-        assert systemone(client, body).status_code == 422
+        response = systemone(client, body)
+        assert response.status_code == 200
+        assert response.json() == systemone(client, request_body(NOUL)).json()
 
         nested = request_body({"q": {"type": "noul", "delay_seconds": 5}})
         assert systemone(client, nested).status_code == 422
@@ -537,7 +542,8 @@ class TestErrorContract:
 
     def test_error_body_shape(self, client: TestClient) -> None:
         payload = systemone(client, request_body({})).json()
-        assert set(payload) == {"error", "request_id"}
+        # spec 5.9: a 422 also carries Jev's own ``detail`` shape (ADR-016).
+        assert set(payload) == {"error", "detail", "request_id"}
         assert set(payload["error"]) <= {"code", "message", "path", "retryable"}
         assert payload["error"]["retryable"] is False
         assert payload["request_id"]

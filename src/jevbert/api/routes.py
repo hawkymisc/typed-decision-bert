@@ -59,7 +59,11 @@ async def system_one(request: Request) -> Response:
 
     parse_started = time.monotonic()
     value = parse_strict_json(body, max_depth=settings.limits.max_json_depth)
-    validated = validate_request(value, settings.limits)
+    validated = validate_request(
+        value,
+        settings.limits,
+        unknown_top_level_fields=settings.compat.unknown_top_level_fields,
+    )
     log["parse_ms"] = round((time.monotonic() - parse_started) * 1000, 3)
     log["questions"] = _question_type_counts(validated)
 
@@ -224,6 +228,7 @@ async def capabilities(request: Request) -> Response:
             "max_score_levels": limits.max_score_levels,
             "max_request_chars": limits.effective_max_request_chars,
             "overflow_policy": limits.overflow_policy,
+            "unknown_top_level_fields": settings.compat.unknown_top_level_fields,
             "request_deadline_seconds": settings.serving.request_deadline_seconds,
             "max_pending_requests": settings.serving.max_pending_requests,
         },

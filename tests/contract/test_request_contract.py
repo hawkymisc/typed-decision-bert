@@ -75,13 +75,15 @@ class TestCT01TypesAndCounts:
         answers = dict(ordered)["answers"]
         assert [key for key, _ in answers] == list(questions)
 
-    def test_thirty_two_questions(self, client: TestClient) -> None:
-        payload = _ok(client, {f"q{i}": {"type": "noul"} for i in range(32)})
-        assert len(payload["answers"]) == 32
+    def test_the_maximum_question_count(self, client: TestClient) -> None:
+        # spec 4.2 raised this from 32 to 256 (ADR-016): Jev states no count ceiling,
+        # only a token budget, so a request must not be refused for its count alone.
+        payload = _ok(client, {f"q{i}": {"type": "noul"} for i in range(256)})
+        assert len(payload["answers"]) == 256
 
-    def test_thirty_three_questions_are_refused(self, client: TestClient) -> None:
+    def test_one_question_past_the_maximum_is_refused(self, client: TestClient) -> None:
         response = systemone(
-            client, request_body({f"q{i}": {"type": "noul"} for i in range(33)})
+            client, request_body({f"q{i}": {"type": "noul"} for i in range(257)})
         )
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "validation_error"
@@ -222,13 +224,16 @@ class TestCT05MalformedInput:
         assert payload["error"]["code"] == "validation_error"
         assert payload["error"]["path"] == ["questions", "q", "type"]
 
-    def test_unknown_top_level_field(self, client: TestClient) -> None:
+    def test_unknown_top_level_field_is_ignored_by_default(
+        self, client: TestClient
+    ) -> None:
+        # ADR-016: the SDK's extra_body can carry one, so the default is to ignore it.
+        # The strict reading is still available; tests/contract/test_compat.py covers
+        # both settings and checks that ignoring really changes nothing.
         body = request_body({"q": {"type": "noul"}}) | {"temperature": 0.7}
         response = systemone(client, body)
-        assert response.status_code == 422
-        payload = response.json()
-        assert payload["error"]["code"] == "validation_error"
-        assert payload["error"]["path"] == ["temperature"]
+        assert response.status_code == 200
+        assert set(response.json()["answers"]) == {"q"}
 
     def test_unknown_question_field(self, client: TestClient) -> None:
         body = request_body({"q": {"type": "noul", "threshold": 0.5}})

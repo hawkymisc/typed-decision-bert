@@ -3,6 +3,9 @@
 Per target, each task is scored on the samples that target answered; the head-to-head
 numbers are computed only on the samples **both** targets answered, so a sample one
 side refused cannot tilt the comparison. Failures show up as coverage instead.
+
+Only records made under the current sample and question count (``current_records``);
+the rest are reported as ``stale_records`` and left out.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from bench.metrics import (
     percentile,
     probabilistic_metrics,
 )
-from bench.runner import latest_records
+from bench.runner import current_records
 
 CAVEATS = "docs/BENCHMARK.md §5"
 
@@ -39,14 +42,16 @@ def build_report(experiment: Experiment) -> dict[str, Any]:
 def _task_report(experiment: Experiment, task: TaskSpec) -> dict[str, Any]:
     examples = read_samples(experiment.output_dir, task.id)
     labels = list(task.labels)
-    records = {
-        target: latest_records(experiment.output_dir, target, task.id)
-        for target in experiment.targets
-    }
-    present = [target for target in experiment.targets if records[target]]
+    records: dict[str, dict[str, dict[str, Any]]] = {}
+    stale: dict[str, int] = {}
+    for target in experiment.targets:
+        records[target], stale[target] = current_records(experiment, target, task)
+    present = [target for target in experiment.targets if records[target] or stale[target]]
 
     targets = {
-        target: _target_report(examples, labels, records[target]) for target in present
+        target: _target_report(examples, labels, records[target])
+        | {"stale_records": stale[target]}
+        for target in present
     }
     pairs = {
         f"{a} vs {b}": _pair_report(examples, labels, records[a], records[b], experiment.seed)
@@ -139,6 +144,14 @@ def _fmt(value: Any, digits: int = 3) -> str:
     return str(value)
 
 
+def _cell(text: Any) -> str:
+    """Text from a server, made safe for one Markdown table cell."""
+    value = str(text)
+    for character in "|`<>\r\n":
+        value = value.replace(character, " ")
+    return value
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Benchmark report: {report['experiment']}",
@@ -165,13 +178,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for name, t in task["targets"].items():
-            models = ", ".join(f"`{m}`×{n}" for m, n in t["response_models"].items())
+            models = ", ".join(f"`{_cell(m)}`×{n}" for m, n in t["response_models"].items())
             lines.append(
                 f"| {name} | {t['ok']} / {t['samples']} | {_fmt(t['coverage'])} | "
                 f"{_fmt(t['accuracy'])} | {_fmt(t['macro_f1'])} | {_fmt(t['any_category_hit'])} | "
                 f"{_fmt(t['nll'])} | {_fmt(t['brier'])} | {_fmt(t['ece'])} | "
                 f"{_fmt(t['latency_ms_p50'], 1)} | {_fmt(t['latency_ms_p95'], 1)} | {models} |"
             )
+        lines.append("")
+        lines += [
+            f"- {name}: statuses {t['statuses']}"
+            + (f"; {t['stale_records']} stale record(s) ignored" if t["stale_records"] else "")
+            for name, t in task["targets"].items()
+        ]
         lines.append("")
         if task["pairs"]:
             lines += [

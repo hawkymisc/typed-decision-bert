@@ -67,8 +67,8 @@ class TestLoading:
         assert experiment.client.max_retries == 2
         assert experiment.client.concurrency == 1
         assert experiment.client.timeout_seconds == 60.0
-        assert experiment.targets["local"].billable is False
-        assert experiment.targets["jev"].billable is True
+        assert experiment.targets["local"].is_billable is False
+        assert experiment.targets["jev"].is_billable is True
 
     def test_output_dir_is_relative_to_the_file_and_defaults_by_name(self, tmp_path: Path) -> None:
         experiment = load_experiment(write(tmp_path, minimal()))
@@ -186,8 +186,8 @@ class TestShippedExperiments:
         experiment = load_experiment(REPO_ROOT / "bench" / "experiments" / "jev-vs-local.yaml")
         assert [task.id for task in experiment.tasks] == ["arxiv-primary", "ag-news", "livedoor"]
         assert set(experiment.targets) == {"local", "jev"}
-        assert experiment.targets["jev"].billable is True
-        assert experiment.targets["local"].billable is False
+        assert experiment.targets["jev"].is_billable is True
+        assert experiment.targets["local"].is_billable is False
 
 
 class TestApiKey:
@@ -209,3 +209,43 @@ class TestApiKey:
         experiment = load_experiment(write(tmp_path, minimal()))
         with pytest.raises(ExperimentError, match="JEV_KEY"):
             resolve_api_key(experiment.targets["jev"], {"LOCAL_KEY": "secret-value"})
+
+
+class TestTargets:
+    def test_a_remote_host_is_billable_unless_it_says_otherwise(self, tmp_path: Path) -> None:
+        data = minimal()
+        del data["targets"]["jev"]["billable"]
+        experiment = load_experiment(write(tmp_path, data))
+        assert experiment.targets["jev"].is_billable is True
+        assert experiment.targets["local"].is_billable is False
+
+        data["targets"]["jev"]["billable"] = False
+        assert load_experiment(write(tmp_path, data)).targets["jev"].is_billable is False
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+    def test_loopback_hosts_are_local(self, tmp_path: Path, host: str) -> None:
+        data = minimal()
+        data["targets"]["local"]["base_url"] = f"http://{host}:8765"
+        assert load_experiment(write(tmp_path, data)).targets["local"].is_billable is False
+
+    def test_plain_http_to_a_remote_host_is_refused(self, tmp_path: Path) -> None:
+        data = minimal()
+        data["targets"]["jev"]["base_url"] = "http://api.typesafe.ai"
+        with pytest.raises(ExperimentError, match="https"):
+            load_experiment(write(tmp_path, data))
+
+    def test_a_target_name_cannot_escape_the_output_directory(self, tmp_path: Path) -> None:
+        data = minimal()
+        data["targets"]["../x"] = data["targets"].pop("local")
+        with pytest.raises(ExperimentError, match="target"):
+            load_experiment(write(tmp_path, data))
+
+
+def test_yaml_and_json_give_the_same_experiment(tmp_path: Path) -> None:
+    (tmp_path / "y").mkdir()
+    (tmp_path / "j").mkdir()
+    from_yaml = load_experiment(write(tmp_path / "y", minimal()))
+    from_json = load_experiment(write(tmp_path / "j", minimal(), ".json"))
+    assert from_yaml.model_dump(exclude={"output_dir"}) == from_json.model_dump(
+        exclude={"output_dir"}
+    )

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from bench.config import Experiment, load_experiment
-from bench.datasets import Example, write_samples
+from bench.datasets import Example, read_manifest, write_samples
 from bench.report import build_report, render_markdown
+from bench.runner import condition_sha256
 
 REVISION = "0" * 40
 
@@ -21,7 +24,7 @@ def experiment(tmp_path: Path) -> Experiment:
         "seed": 1,
         "output_dir": "out",
         "targets": {
-            "local": {"base_url": "http://local.test", "api_key_env": "L"},
+            "local": {"base_url": "http://127.0.0.1:8765", "api_key_env": "L"},
             "jev": {"base_url": "https://jev.test", "api_key_env": "J", "billable": True},
         },
         "tasks": [
@@ -65,6 +68,10 @@ def record(sample_id: str, choice: str | None, *, status: str = "ok", sha: str =
 
 
 def write_run(exp: Experiment, target: str, records: list[dict[str, Any]]) -> None:
+    """Stamp each record with the current sample and question, unless it names its own."""
+    sample = read_manifest(exp.output_dir, "arxiv")["sha256"]
+    condition = condition_sha256(exp, exp.tasks[0])
+    records = [{"sample_sha256": sample, "condition_sha256": condition} | r for r in records]
     path = exp.output_dir / "runs" / target / "arxiv.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
@@ -138,3 +145,53 @@ class TestReport:
         text = render_markdown(build_report(exp))
         assert "BENCHMARK.md" in text
         assert "| local |" in text
+
+    def test_samples_never_sent_are_counted_as_such(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        write_run(exp, "local", [record("p1", "cs.CL")])
+        local = build_report(exp)["tasks"]["arxiv"]["targets"]["local"]
+        assert local["statuses"] == {"ok": 1, "not_sent": 3}
+        assert local["coverage"] == 0.25
+
+    def test_probabilities_latency_and_attempts_are_summarised(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        write_run(exp, "local", [
+            record("p1", "cs.CL", latency=10.0), record("p2", "cs.CV", latency=30.0),
+            record("p3", "cs.LG", latency=20.0) | {"probabilities": None},
+        ])
+        local = build_report(exp)["tasks"]["arxiv"]["targets"]["local"]
+        # Only p1 and p2 carry a distribution; both put 0.8 on the gold label.
+        assert local["nll"] == pytest.approx(-math.log(0.8))
+        assert local["latency_ms_p50"] == 20.0
+        assert local["mean_attempts"] == 1.0
+
+    def test_a_pair_with_no_common_answer_reports_zero(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        write_run(exp, "local", [record("p1", "cs.CL")])
+        write_run(exp, "jev", [record("p2", "cs.CV")])
+        pair = build_report(exp)["tasks"]["arxiv"]["pairs"]["local vs jev"]
+        assert pair["n"] == 0 and pair["accuracy_a"] is None
+        assert "local vs jev | 0 |" in render_markdown(build_report(exp))
+
+    def test_a_task_without_runs_says_so(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        assert "No run yet." in render_markdown(build_report(exp))
+
+    def test_records_made_under_another_question_are_left_out(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        write_run(exp, "local", [
+            record("p1", "cs.CL") | {"condition_sha256": "other"},
+            record("p2", "cs.CV") | {"sample_sha256": "other"},
+            record("p3", "cs.LG"),
+        ])
+        local = build_report(exp)["tasks"]["arxiv"]["targets"]["local"]
+        assert local["ok"] == 1
+        assert local["stale_records"] == 2
+
+    def test_a_server_supplied_model_name_cannot_break_the_table(self, tmp_path: Path) -> None:
+        exp = setup(tmp_path)
+        write_run(exp, "local", [record("p1", "cs.CL", model="x|y`\n<b>")])
+        text = render_markdown(build_report(exp))
+        row = next(line for line in text.splitlines() if line.startswith("| local |"))
+        assert row.count("|") == 13
+        assert "<b>" not in text

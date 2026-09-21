@@ -5,8 +5,9 @@ Pure functions over plain lists, so the report and its tests share one definitio
 Conventions:
 
 * ``macro_f1`` averages over the labels that occur in the gold labels **or** in the
-  predictions (a label nobody predicted and nobody needed does not dilute it); an
-  undefined precision or recall counts as 0.
+  predictions, as scikit-learn does (a label nobody predicted and nobody needed does
+  not dilute it; a prediction outside ``labels`` is scored, with F1 = 0); an undefined
+  precision or recall counts as 0.
 * The probabilistic metrics read the returned *distribution*, never the ``confidence``
   field, because the two targets define ``confidence`` differently (BENCHMARK C3).
   ECE bins answers by the top probability of that distribution.
@@ -33,8 +34,9 @@ def classification_metrics(
         confusion.setdefault(g, {}).setdefault(p, 0)
         confusion[g][p] += 1
 
+    extra = sorted(set(pred) - set(labels))
     per_label: dict[str, dict[str, float]] = {}
-    for label in labels:
+    for label in [*labels, *extra]:
         tp = sum(1 for g, p in zip(gold, pred, strict=True) if g == label and p == label)
         predicted = sum(1 for p in pred if p == label)
         support = sum(1 for g in gold if g == label)
@@ -56,7 +58,7 @@ def classification_metrics(
             "per_label": per_label,
             "confusion": confusion,
         }
-    present = [label for label in labels if label in set(gold) | set(pred)]
+    present = [label for label in per_label if label in set(gold) | set(pred)]
     return {
         "n": len(gold),
         "accuracy": sum(1 for g, p in zip(gold, pred, strict=True) if g == p) / len(gold),
@@ -86,8 +88,7 @@ def probabilistic_metrics(
             (float(distribution.get(label, 0.0)) - (1.0 if label == g else 0.0)) ** 2
             for label in labels
         )
-        # Ties go to the smallest key, as the API's argmax does (spec I05).
-        top_label = min(distribution, key=lambda key: (-distribution[key], key))
+        top_label = top_choice(distribution)
         top = float(distribution[top_label])
         index = min(bins - 1, max(0, math.ceil(top * bins) - 1))
         binned[index].append((top, top_label == g))
@@ -100,6 +101,11 @@ def probabilistic_metrics(
             confidence = sum(top for top, _ in entries) / len(entries)
             ece += len(entries) / n * abs(accuracy - confidence)
     return {"n": n, "nll": nll / n, "brier": brier / n, "ece": ece}
+
+
+def top_choice(distribution: Mapping[str, float]) -> str:
+    """The argmax; a tie goes to the smallest key, as the API's argmax does (spec I05)."""
+    return min(distribution, key=lambda key: (-float(distribution[key]), key))
 
 
 def mcnemar_exact_p(b: int, c: int) -> float:

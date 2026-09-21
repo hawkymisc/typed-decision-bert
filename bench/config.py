@@ -18,6 +18,7 @@ import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -27,6 +28,10 @@ DEFAULT_MODEL = "jev-latest"
 
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _YYMM = re.compile(r"^\d{4}$")
+_NAME = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+
+#: Hosts that are this machine. Anything else is treated as someone else's service.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class ExperimentError(Exception):
@@ -106,7 +111,7 @@ class SampleSpec(_Strict):
 class TaskSpec(_Strict):
     """One dataset turned into one Choice question per sample."""
 
-    id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")]
+    id: Annotated[str, Field(pattern=_NAME)]
     source: Source
     #: ``state`` key -> how to make it. The keys are what both targets see.
     state: dict[str, FieldSpec] = Field(min_length=1)
@@ -138,8 +143,31 @@ class TargetSpec(_Strict):
     api_key_env: str
     #: A ``KEY=VALUE`` file read when the environment does not hold ``api_key_env``.
     dotenv: Path | None = None
-    #: A billable target is sent to only with ``--allow-billable`` (BENCHMARK 6).
-    billable: bool = False
+    #: A billable target is sent to only with ``--allow-billable`` (BENCHMARK 6). Left
+    #: out, a target is billable unless its host is this machine: forgetting the flag
+    #: must not be what lets paid requests through.
+    billable: bool | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _https_off_this_machine(cls, base_url: str) -> str:
+        parts = urlsplit(base_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"base_url must be an http(s) URL with a host, got {base_url!r}")
+        if parts.scheme == "http" and parts.hostname not in LOOPBACK_HOSTS:
+            raise ValueError(
+                "base_url must use https for a host other than this machine; "
+                "the API key would otherwise travel in clear text"
+            )
+        return base_url
+
+    @property
+    def is_local(self) -> bool:
+        return urlsplit(self.base_url).hostname in LOOPBACK_HOSTS
+
+    @property
+    def is_billable(self) -> bool:
+        return (not self.is_local) if self.billable is None else self.billable
 
 
 class ClientSpec(_Strict):
@@ -153,7 +181,7 @@ class ClientSpec(_Strict):
 
 
 class Experiment(_Strict):
-    name: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")]
+    name: Annotated[str, Field(pattern=_NAME)]
     output_dir: Path
     seed: int
     model: str = DEFAULT_MODEL
@@ -161,6 +189,16 @@ class Experiment(_Strict):
     client: ClientSpec = ClientSpec()
     targets: dict[str, TargetSpec] = Field(min_length=1)
     tasks: list[TaskSpec] = Field(min_length=1)
+
+    @field_validator("targets")
+    @classmethod
+    def _target_names(cls, targets: dict[str, TargetSpec]) -> dict[str, TargetSpec]:
+        for name in targets:
+            if not re.match(_NAME, name) or name in (".", ".."):
+                raise ValueError(
+                    f"target name {name!r} must match {_NAME}; it becomes a directory name"
+                )
+        return targets
 
     @model_validator(mode="after")
     def _unique_task_ids(self) -> Experiment:
@@ -175,7 +213,14 @@ class Experiment(_Strict):
         for task in self.tasks:
             if task.id == task_id:
                 return task
-        raise KeyError(task_id)
+        known = ", ".join(task.id for task in self.tasks)
+        raise ExperimentError(f"unknown task {task_id!r}; the file declares {known}")
+
+    def target(self, name: str) -> TargetSpec:
+        if name not in self.targets:
+            known = ", ".join(self.targets)
+            raise ExperimentError(f"unknown target {name!r}; the file declares {known}")
+        return self.targets[name]
 
 
 def load_experiment(path: str | os.PathLike[str]) -> Experiment:

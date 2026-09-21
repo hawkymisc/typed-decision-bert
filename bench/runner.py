@@ -1,4 +1,4 @@
-"""Send the prepared sample through the official SDK, and record every outcome (BENCHMARK 3).
+"""Send the prepared sample through the official SDK, and record every outcome (BENCHMARK 3, 7).
 
 Both targets go through ``typesafe_sdk.TypeSafeClient`` with the same retry policy and
 timeout; only the base URL and the key differ. A recording transport under the SDK
@@ -6,9 +6,15 @@ keeps, per attempt, the SHA-256 of the body bytes the SDK actually sent and the 
 response, so the report can prove the two targets were sent the same bytes and can
 read the wire answer rather than the SDK's typed restoration of it.
 
-One JSON line per sample per run is appended to ``runs/<target>/<task>.jsonl``. A rerun
-sends only the samples whose latest record is not ``ok``, so a run that stopped part
-way resumes where it stopped.
+One JSON line per sample per run is appended to ``runs/<target>/<task>.jsonl``. Each
+line carries the SHA-256 of the sample file and of the question it was asked under;
+a record whose sample or question no longer matches the experiment file is ignored,
+so a changed wording can never be mixed into a result (BENCHMARK 2.3).
+
+A rerun sends a sample again only when its latest record is a failure that retrying
+can fix (no connection, 408, 429, 5xx). A final answer - a 422, an answer without a
+choice - is not sent again unless ``retry_failed`` is set: it was answered, possibly
+billed, and would be answered the same way.
 """
 
 from __future__ import annotations
@@ -40,6 +46,11 @@ from bench.datasets import Example, SampleError, read_manifest, read_samples, ta
 #: The error text kept per record; enough to tell 422 reasons apart.
 _ERROR_CHARS = 500
 
+#: HTTP statuses a rerun sends again; the SDK's own retry set (RetryPolicy default).
+RETRYABLE_HTTP = frozenset({408, 429, *range(500, 600)})
+
+REQUEST_ID_HEADER = "x-typesafe-request-id"
+
 
 class BillableTargetRefused(Exception):
     """A billable target was asked to run without ``--allow-billable``."""
@@ -48,9 +59,10 @@ class BillableTargetRefused(Exception):
 @dataclass
 class Attempt:
     request_sha256: str
-    status_code: int | None
-    response_body: bytes | None
-    elapsed_ms: float
+    status_code: int | None = None
+    response_body: bytes | None = None
+    request_id: str | None = None
+    elapsed_ms: float = 0.0
 
 
 class RecordingTransport(httpx2.BaseTransport):
@@ -69,18 +81,19 @@ class RecordingTransport(httpx2.BaseTransport):
         return self._local.attempts
 
     def handle_request(self, request: httpx2.Request) -> httpx2.Response:
-        body = request.read()
-        attempts: list[Attempt] = getattr(self._local, "attempts", [])
-        attempt = Attempt(hashlib.sha256(body).hexdigest(), None, None, 0.0)
+        attempts: list[Attempt] | None = getattr(self._local, "attempts", None)
+        if attempts is None:
+            raise RuntimeError("RecordingTransport.begin() was not called on this thread")
+        attempt = Attempt(hashlib.sha256(request.read()).hexdigest())
         attempts.append(attempt)
         started = time.perf_counter()
         try:
             response = self._inner.handle_request(request)
-            content = response.read()
+            attempt.response_body = response.read()
         finally:
             attempt.elapsed_ms = (time.perf_counter() - started) * 1000
         attempt.status_code = response.status_code
-        attempt.response_body = content
+        attempt.request_id = response.headers.get(REQUEST_ID_HEADER)
         return response
 
     def close(self) -> None:
@@ -92,6 +105,7 @@ class RunSummary:
     target: str
     sent: int = 0
     skipped: int = 0
+    interrupted: bool = False
     by_status: dict[str, int] = field(default_factory=dict)
 
 
@@ -108,6 +122,14 @@ def _question(task: TaskSpec) -> dict[str, Any]:
     return {"type": "choice", "instructions": task.instructions, "criteria": dict(task.labels)}
 
 
+def condition_sha256(experiment: Experiment, task: TaskSpec) -> str:
+    """Everything in the body except the state: the model and the question, verbatim."""
+    condition = {"model": experiment.model, "questions": {experiment.question_id: _question(task)}}
+    return hashlib.sha256(
+        json.dumps(condition, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def runs_path(output_dir: Path, target: str, task_id: str) -> Path:
     return output_dir / "runs" / target / f"{task_id}.jsonl"
 
@@ -116,34 +138,81 @@ def read_records(output_dir: Path, target: str, task_id: str) -> list[dict[str, 
     path = runs_path(output_dir, target, task_id)
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    records = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise SampleError(
+                f"{path}:{number} is not a JSON record (a run killed mid-write?); "
+                "delete that line and run again"
+            ) from exc
+    return records
 
 
-def latest_records(output_dir: Path, target: str, task_id: str) -> dict[str, dict[str, Any]]:
-    """The last record of each sample: a retried sample is judged by its latest outcome."""
-    return {record["sample_id"]: record for record in read_records(output_dir, target, task_id)}
-
-
-def pending_samples(
-    experiment: Experiment, target: str, task: TaskSpec, limit: int | None
-) -> tuple[list[Example], int]:
-    """The samples still to send for one task, and how many are already done."""
+def check_sample(experiment: Experiment, task: TaskSpec) -> dict[str, Any]:
+    """The manifest, if the sample on disk was drawn under what the file now says."""
     manifest = read_manifest(experiment.output_dir, task.id)
     if manifest.get("task_fingerprint") != task_fingerprint(task):
         raise SampleError(
             f"the sample for {task.id!r} was drawn under a different source, state, label set "
             "or sample size than the experiment file now says; run `python -m bench prepare` "
-            "again (and discard the runs made on the old sample)"
+            "again"
         )
+    return manifest
+
+
+def current_records(
+    experiment: Experiment, target: str, task: TaskSpec
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """The latest record of each sample made under the current sample and question.
+
+    Returns the records and how many records were left out as stale.
+    """
+    sample = check_sample(experiment, task)["sha256"]
+    condition = condition_sha256(experiment, task)
+    latest: dict[str, dict[str, Any]] = {}
+    stale = 0
+    for record in read_records(experiment.output_dir, target, task.id):
+        if record.get("sample_sha256") != sample or record.get("condition_sha256") != condition:
+            stale += 1
+            continue
+        latest[record["sample_id"]] = record
+    return latest, stale
+
+
+def is_retryable(record: Mapping[str, Any]) -> bool:
+    """A failure that sending again can fix: no connection, or 408 / 429 / 5xx."""
+    status = record.get("status")
+    if status == "connection_error":
+        return True
+    return status == "api_error" and record.get("http_status") in RETRYABLE_HTTP
+
+
+def pending_samples(
+    experiment: Experiment,
+    target: str,
+    task: TaskSpec,
+    limit: int | None,
+    retry_failed: bool = False,
+) -> tuple[list[Example], int]:
+    """The samples still to send for one task, and how many are already settled."""
     examples = read_samples(experiment.output_dir, task.id)
+    records, _ = current_records(experiment, target, task)
     if limit is not None:
         examples = examples[:limit]
-    done = {
-        sample_id
-        for sample_id, record in latest_records(experiment.output_dir, target, task.id).items()
-        if record["status"] == "ok"
-    }
-    todo = [example for example in examples if example.sample_id not in done]
+
+    def settled(example: Example) -> bool:
+        record = records.get(example.sample_id)
+        if record is None:
+            return False
+        if record["status"] == "ok":
+            return True
+        return not (retry_failed or is_retryable(record))
+
+    todo = [example for example in examples if not settled(example)]
     return todo, len(examples) - len(todo)
 
 
@@ -154,31 +223,41 @@ def run_target(
     task_ids: list[str] | None = None,
     limit: int | None = None,
     allow_billable: bool = False,
+    retry_failed: bool = False,
     env: Mapping[str, str] | None = None,
     transport: httpx2.BaseTransport | None = None,
+    stop: threading.Event | None = None,
     log: Callable[[str], None] = print,
 ) -> RunSummary:
-    target = experiment.targets[target_name]
+    target = experiment.target(target_name)
     tasks = [experiment.task(task_id) for task_id in task_ids] if task_ids else experiment.tasks
 
-    plan = [(task, *pending_samples(experiment, target_name, task, limit)) for task in tasks]
+    plan = [
+        (task, *pending_samples(experiment, target_name, task, limit, retry_failed))
+        for task in tasks
+    ]
     to_send = sum(len(todo) for _, todo, _ in plan)
-    if target.billable and not allow_billable and to_send:
+    if target.is_billable and not allow_billable and to_send:
+        attempts = to_send * (experiment.client.max_retries + 1)
         raise BillableTargetRefused(
-            f"{target_name} is billable and {to_send} requests would be sent; "
-            "pass --allow-billable to send them"
+            f"{target_name} is billable and {to_send} requests would be sent (up to {attempts} "
+            "HTTP attempts with retries); pass --allow-billable to send them"
         )
     api_key = resolve_api_key(target, env)
+    stop = stop or threading.Event()
 
     summary = RunSummary(target_name)
     for task, todo, done in plan:
         summary.skipped += done
-        log(f"[{target_name}/{task.id}] {len(todo)} to send, {done} already ok")
-        if not todo:
+        log(f"[{target_name}/{task.id}] {len(todo)} to send, {done} already settled")
+        if not todo or stop.is_set():
             continue
         path = runs_path(experiment.output_dir, target_name, task.id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _send_all(experiment, target_name, api_key, task, todo, path, transport, summary, log)
+        _send_all(
+            experiment, target_name, api_key, task, todo, path, transport, summary, stop, log
+        )
+    summary.interrupted = stop.is_set()
     return summary
 
 
@@ -191,6 +270,7 @@ def _send_all(
     path: Path,
     transport: httpx2.BaseTransport | None,
     summary: RunSummary,
+    stop: threading.Event,
     log: Callable[[str], None],
 ) -> None:
     work: queue.Queue[Example] = queue.Queue()
@@ -198,7 +278,8 @@ def _send_all(
         work.put(example)
     write_lock = threading.Lock()
     errors: list[BaseException] = []
-    progress = {"count": 0}
+    sample_sha = read_manifest(experiment.output_dir, task.id)["sha256"]
+    condition = condition_sha256(experiment, task)
 
     recorder = RecordingTransport(transport or httpx2.HTTPTransport())
     target = experiment.targets[target_name]
@@ -218,39 +299,51 @@ def _send_all(
             ),
         )
         with client:
-            while True:
+            while not stop.is_set():
                 try:
                     example = work.get_nowait()
                 except queue.Empty:
                     return
                 record = _send_one(experiment, target_name, task, example, client, recorder)
+                record["sample_sha256"] = sample_sha
+                record["condition_sha256"] = condition
                 line = json.dumps(record, ensure_ascii=False) + "\n"
                 with write_lock:
                     with path.open("a", encoding="utf-8") as handle:
                         handle.write(line)
                     summary.sent += 1
-                    summary.by_status[record["status"]] = (
-                        summary.by_status.get(record["status"], 0) + 1
-                    )
-                    progress["count"] += 1
-                    if progress["count"] % 20 == 0 or progress["count"] == len(todo):
-                        log(f"[{target_name}/{task.id}] {progress['count']}/{len(todo)}")
+                    status = record["status"]
+                    summary.by_status[status] = summary.by_status.get(status, 0) + 1
+                    count = sum(summary.by_status.values())
+                    if count % 20 == 0:
+                        log(f"[{target_name}/{task.id}] {summary.sent} sent")
 
     def guarded() -> None:
         try:
             worker()
-        except BaseException as exc:  # recorded and re-raised on the calling thread below
+        except BaseException as exc:  # handed to the calling thread, which re-raises it
             errors.append(exc)
+            stop.set()
 
     threads = [
-        threading.Thread(target=guarded, name=f"bench-{target_name}-{index}")
+        threading.Thread(target=guarded, name=f"bench-{target_name}-{index}", daemon=True)
         for index in range(min(experiment.client.concurrency, len(todo)))
     ]
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join()
-    recorder.close()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            for thread in threads:
+                thread.join(timeout=0.2)
+    except KeyboardInterrupt:
+        # Stop taking new samples; the requests already in flight finish and are recorded.
+        log(f"[{target_name}/{task.id}] interrupted; finishing the requests in flight")
+        stop.set()
+        for thread in threads:
+            thread.join()
+        raise
+    finally:
+        recorder.close()
     if errors:
         raise RuntimeError(f"a worker for {target_name}/{task.id} failed") from errors[0]
 
@@ -296,10 +389,7 @@ def _send_one(
     }
     started = time.perf_counter()
     try:
-        response = client.system_one(
-            state=body["state"], questions=body["questions"], model=body["model"]
-        )
-        record["request_id"] = response.request_id
+        client.system_one(state=body["state"], questions=body["questions"], model=body["model"])
     except TypeSafeAPIResponseValidationError as exc:
         record.update(status="response_invalid", error=_error_text(exc))
     except TypeSafeAPIError as exc:
@@ -313,9 +403,14 @@ def _send_one(
     record["request_sha256"] = attempts[0].request_sha256 if attempts else None
     last = attempts[-1] if attempts else None
     record["last_attempt_ms"] = last.elapsed_ms if last else None
-
+    record["request_id"] = last.request_id if last else None
     wire = _parse(last.response_body) if last and last.response_body else None
     record["response"] = wire
+
+    if len({attempt.request_sha256 for attempt in attempts}) > 1:
+        # The SDK encodes the body once and resends those bytes; if that ever changes,
+        # the hash that proves both targets saw the same request is no longer meaningful.
+        record.update(status="request_changed", error="the body differed between retries")
     if record["status"] == "ok":
         record["http_status"] = last.status_code if last else None
         answer = (wire or {}).get("answers", {}).get(experiment.question_id, {})
@@ -324,6 +419,8 @@ def _send_one(
         record["confidence"] = answer.get("confidence")
         record["response_model"] = (wire or {}).get("model")
         record["usage"] = (wire or {}).get("usage")
+        if record["choice"] is None:
+            record.update(status="no_choice", error="the answer carries no choice")
     return record
 
 

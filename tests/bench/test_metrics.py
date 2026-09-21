@@ -16,6 +16,7 @@ from bench.metrics import (
     paired_comparison,
     percentile,
     probabilistic_metrics,
+    top_choice,
 )
 
 
@@ -150,3 +151,46 @@ class TestPercentile:
 
     def test_empty_is_none(self) -> None:
         assert percentile([], 50) is None
+
+
+class TestEdges:
+    def test_a_prediction_outside_the_label_set_counts_against_macro_f1(self) -> None:
+        # Pinned: an unexpected label is scored like sklearn scores it, F1 = 0.
+        result = classification_metrics(["a", "b"], ["a", "d"], labels=["a", "b"])
+        assert result["macro_f1"] == pytest.approx((1.0 + 0.0 + 0.0) / 3)
+
+    def test_a_tie_in_the_distribution_goes_to_the_smallest_key(self) -> None:
+        assert top_choice({"b": 0.5, "a": 0.5, "c": 0.0}) == "a"
+        assert top_choice({"ab": 0.4, "a": 0.4, "z": 0.2}) == "a"
+
+    def test_a_probability_on_a_bin_edge_goes_to_the_lower_bin(self) -> None:
+        # 0.8 belongs to (0.7, 0.8]; with 0.75 beside it the bin mean is 0.775.
+        result = probabilistic_metrics(
+            ["a", "a"], [{"a": 0.8, "b": 0.2}, {"a": 0.75, "b": 0.25}], labels=["a", "b"], bins=10
+        )
+        assert result["ece"] == pytest.approx(1.0 - 0.775)
+
+    def test_mcnemar_values(self) -> None:
+        assert mcnemar_exact_p(2, 1) == 1.0
+        assert mcnemar_exact_p(7, 2) == pytest.approx(2 * (1 + 9 + 36) / 512)
+
+    def test_a_constant_difference_has_a_zero_width_interval(self) -> None:
+        # a is right and b wrong on every pair: every resample differs by exactly 1.
+        result = paired_comparison(["a"] * 10, ["a"] * 10, ["b"] * 10, seed=3, n_boot=100)
+        assert result["difference_ci95"] == [1.0, 1.0]
+
+    def test_the_interval_has_the_width_of_a_resampled_proportion(self) -> None:
+        # Half the pairs favour a, half are ties: d in {1, 0}, mean 0.5, SE = 0.5/sqrt(n).
+        n = 400
+        gold = ["a"] * n
+        pred_a = ["a"] * n
+        pred_b = ["a", "b"] * (n // 2)
+        low, high = paired_comparison(gold, pred_a, pred_b, seed=1, n_boot=2000)[
+            "difference_ci95"
+        ]
+        se = 0.5 / n**0.5
+        assert low == pytest.approx(0.5 - 1.96 * se, abs=0.01)
+        assert high == pytest.approx(0.5 + 1.96 * se, abs=0.01)
+
+    def test_percentile_zero_is_the_minimum(self) -> None:
+        assert percentile([3.0, 1.0, 2.0], 0) == 1.0

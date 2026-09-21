@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| 文書バージョン | 0.1.0（2026-09-22） |
+| 文書バージョン | 0.2.0（2026-09-22。レビュー指摘を反映） |
 | 対象 | `bench/` パッケージ、`bench/experiments/*.yaml` |
 | 段階 | **環境構築のみ**。実 Jev に対する実験は一度も実行していない（課金が発生するため。§6） |
 
@@ -30,9 +30,16 @@ uv run python -m bench report  bench/experiments/jev-vs-local.yaml        # 比�
 
 動作環境は Windows ネイティブ（本リポジトリの `.venv`）で確認した。WSL2 固有の設定は無い。
 
-- 途中で止めても `run` を再実行すれば**成功済みの標本は飛ばして続きから**送る（結果は追記型 JSONL）。
-- `--limit N` で各タスクの先頭 N 件だけ送れる（標本の順序は固定なので、両ターゲットで同じ N 件になる）。
-- 課金対象（`billable: true`）のターゲットは `--allow-billable` が無いと**送信せずに件数だけ表示して終了**する。
+- 途中で止めても `run` を再実行すれば**決着済みの標本は飛ばして続きから**送る（結果は追記型 JSONL）。
+  再送するのは「送り直せば直り得る失敗」（接続失敗・408・429・5xx）だけ。422 や choice の無い応答のように
+  **相手が答えた失敗**は、課金済みの可能性があり同じ答えが返るだけなので再送しない（`--retry-failed` で再送する）。
+- Ctrl+C で止めると、新しい標本は取らず、送信中の要求だけ終えて記録してから終了する（終了コード 130）。
+- `--limit N`（1 以上）で各タスクの先頭 N 件だけ送れる（標本の順序は固定なので、両ターゲットで同じ N 件になる）。
+- 課金対象のターゲットは `--allow-billable` が無いと**送信せずに件数（retry 込みの最大試行回数も）を表示して終了**する。
+  `billable` を書き忘れても安全側に倒れるよう、**`127.0.0.1`・`localhost`・`::1` 以外のホストは既定で課金対象**とする
+  （明示的に `billable: false` と書いたときだけ外れる）。ローカル以外への `http://` は API key が平文で流れるため読み込み時に拒否する。
+
+終了コード: 0 完了 / 1 失敗した標本がある / 2 設定・標本・key の不備 / 3 課金対象への送信を拒否 / 130 中断。
 
 ## 2. データセット
 
@@ -47,7 +54,8 @@ uv run python -m bench report  bench/experiments/jev-vs-local.yaml        # 比�
 ### 2.1 arXiv タスクの作り方
 
 - **「最近の論文」に限定**する: 新形式 ID の年月（`YYMM.NNNNN` の `YYMM`）が **2606 以降**（2026 年 6 月〜
-  固定 snapshot の 2026-09-21 まで）の論文だけを使う。該当は 113,723 件（2026-09-22 に固定 revision で実測）。
+  固定 snapshot の 2026-09-21 まで）の論文だけを使う。該当は 113,723 件、そのうち primary が 16 ラベルの
+  いずれかであるものが 55,790 件（2026-09-22 に固定 revision で実測）。
   学習データに入っている可能性（contamination）を下げるための選択である（§5 C1）。
 - 正解は `categories` の**先頭**のカテゴリ（arXiv の慣例では先頭が primary）。
 - 16 ラベルは、該当期間で件数が多いものから、紛らわしい組（`cs.LG`/`stat.ML`/`cs.AI`、`cs.CV`/`eess.SP`）と
@@ -71,7 +79,10 @@ uv run python -m bench report  bench/experiments/jev-vs-local.yaml        # 比�
 - 送信側はこのファイルだけを読む。**データセットの取得と送信は分離**してあり、両ターゲットは同じファイルから送る。
 - 標本ファイルが manifest の SHA-256 と合わない（後から編集された）場合、または設定ファイルの取得元・state・
   ラベル集合・標本数が manifest 作成時と変わった場合は、`run` が送信を拒否して `prepare` のやり直しを求める。
-  ラベルの**説明文**と指示文は標本に影響しないので、変えても `prepare` は要らない（ただし既存の結果とは別条件になる）。
+  ラベルの**説明文**と指示文は標本に影響しないので、変えても `prepare` は要らない。
+- 結果の各行には、**標本ファイルの SHA-256** と **質問条件の SHA-256**（model・質問 ID・指示文・候補とその説明。
+  state 以外の本文すべて）を記録する。今の設定と合わない行は `run` の再開判定でも `report` の集計でも**使わない**
+  （`report` には「stale record(s) ignored」として件数を出す）。指示文を変えて再開しても、古い文言の結果が混ざらない。
 
 ### 2.4 データに残っている癖（手を加えていない）
 
@@ -111,7 +122,8 @@ uv run python -m bench report  bench/experiments/jev-vs-local.yaml        # 比�
 | 質問の型・指示文・候補とその説明 | 設定ファイルの 1 か所に書き、両ターゲットで共有する（ターゲット別に上書きできない） |
 | model 名 | 既定は両方 `jev-latest`（SDK 既定）。応答の `model` を標本ごとに記録する |
 | クライアント | 公式 SDK 0.7.0 の同期クライアント。retry（既定 `max_retries: 2`）・timeout（既定 60 秒）・同時実行数（既定 1）は `client:` で共有 |
-| 評価する標本 | 比較表は**両ターゲットが両方とも成功した標本の共通部分**で計算する。片方だけの失敗は「カバレッジ」として別に出す |
+| 評価する標本 | 対比較の表は**両ターゲットが両方とも成功した標本の共通部分**で計算する。ターゲット別の表はそのターゲットが成功した標本で計算し、失敗は「カバレッジ」と状態別件数（`not_sent` を含む）で出す |
+| 条件の一致 | 結果の各行に標本と質問条件のハッシュを持たせ、今の設定と一致する行だけを集計する（§2.3） |
 | 指標 | 同じ関数（`bench/metrics.py`）で計算する。対応のある比較（McNemar の正確検定、正解率差の paired bootstrap 95% 区間）を出す |
 
 ## 5. apple-to-apple に**できない**もの（留保）
@@ -133,6 +145,7 @@ uv run python -m bench report  bench/experiments/jev-vs-local.yaml        # 比�
 | C11 | **token 数・費用は比較できない。** ローカルの `usage.input_tokens` は自前の tokenizer での数で、Jev の課金 token とは定義が違う（仕様書 §5.8、`compat/differences.md` D03。候補ごとに state を繰り返すので候補数に比例して大きくなる） | `usage` は記録するが比較表に出さない |
 | C12 | **データの利用条件。** livedoor は CC BY-ND 2.1 JP、AG News は配布元のライセンス表記なし（学術利用が慣行）、arXiv メタデータは CC0（要旨の著作権は著者）。データはリポジトリに含めず、利用者の手元で取得する | **実 Jev に送る = 第三者のサービスにテキストを送る**ことになる。データの利用条件と実 Jev の利用規約の確認は利用者の責任で行う |
 | C13 | **ローカル側は学習済み JevBERT ではない。** 中身は zero-shot NLI 分類器（README「ではない」） | 比較は「現在のローカル実装」と「実 Jev」の比較であり、JevBERT という手法の上限の評価ではない |
+| C14 | **正規表現の除去（`remove_patterns`）は切り詰めの前に全文へかかる。** 設定ファイルに病的な正規表現を書くと `prepare` が遅くなり得る | 設定ファイルは自分で書くものとして許容した（第三者の入力ではない） |
 
 ## 6. 実 Jev を叩くときの手順と注意
 
@@ -150,9 +163,21 @@ bench_runs/<実験名>/            ← gitignore 対象
   samples/<タスク>.jsonl         送信する state・正解・メタデータ（prepare が書く）
   samples/<タスク>.manifest.json 取得元 revision・抽出条件・SHA-256
   runs/<ターゲット>/<タスク>.jsonl  1 標本 1 行: 状態・HTTP status・choice・確率・confidence・応答 model・
-                                  request_id・usage・所要時間・試行回数・送信本文の SHA-256・wire の応答 JSON
+                                  request_id・usage・所要時間・試行回数・送信本文の SHA-256・wire の応答 JSON・
+                                  標本と質問条件の SHA-256
   report.md / report.json        比較表（report が書く）
 ```
+
+### 7.1 状態（`status`）
+
+| 値 | 意味 | 再実行で再送するか |
+| --- | --- | --- |
+| `ok` | choice のある応答を得た | しない |
+| `api_error` | HTTP エラー（`http_status` に番号） | 408・429・5xx は再送。それ以外（422 など）は `--retry-failed` のときだけ |
+| `connection_error` | 接続できない・timeout | 再送 |
+| `no_choice` | 200 だが choice が無い | `--retry-failed` のときだけ |
+| `response_invalid` / `sdk_error` | SDK が応答を検証できなかった等 | `--retry-failed` のときだけ |
+| `request_changed` | retry の間に送信本文が変わった（SDK の挙動が変わった兆候。apple-to-apple の前提が崩れる） | `--retry-failed` のときだけ |
 
 ## 8. 環境構築時の動作確認（2026-09-22、Windows ネイティブ）
 
@@ -160,11 +185,13 @@ bench_runs/<実験名>/            ← gitignore 対象
 
 | 確認 | 結果 |
 | --- | --- |
-| 単体テスト（`tests/bench/`、69 件） | すべて成功。リポジトリ全体は 1120 passed / 136 skipped（skip はモデル重みの無い worktree での `model` マーカー） |
+| 単体テスト（`tests/bench/`、108 件） | すべて成功。リポジトリ全体は 1159 passed / 136 skipped（skip はモデル重みの無い worktree での `model` マーカー） |
 | `prepare`（3 タスク） | arXiv 240 件（該当 55,790 件から）・AG News 200 件（7,600 件から）・livedoor 180 件（734 件から） |
 | 別ディレクトリへの 2 回目の `prepare` | 標本ファイルが**バイト単位で一致**（再現性） |
 | `run --target local`（620 件） | 620 / 620 が `ok`、所要 38 秒（同時実行 1）。再実行すると 620 件すべて skip（再開動作） |
-| `run --target jev`（`--allow-billable` なし） | 送信せず終了コード 3（「620 requests would be sent」） |
+| 同じ標本でローカルを 2 回実行 | 3 タスクとも正解率が完全一致（ローカル側の決定性。C9） |
+| 条件ハッシュ導入前の記録 620 件が残った状態で `run` | 620 件を古い記録として無視して送り直し、`report` に「stale record(s) ignored」と表示 |
+| `run --target jev`（`--allow-billable` なし） | 送信せず終了コード 3（「620 requests would be sent (up to 1860 HTTP attempts with retries)」） |
 | `run --target jev --allow-billable`（key 未設定） | 送信せず終了コード 2（「set TYPESAFE_API_KEY」） |
 | 2 ターゲットの対比較（両方ともローカルを指す一時設定、各タスク 10 件） | 送信本文の SHA-256 一致 **10 / 10**、予測の一致率 1.000、McNemar p = 1.0（同じサーバーなので当然の結果。比較経路が正しく動くことの確認） |
 
@@ -187,4 +214,5 @@ bench_runs/<実験名>/            ← gitignore 対象
 
 | 版 | 日付 | 内容 |
 | --- | --- | --- |
+| 0.2.0 | 2026-09-22 | レビュー（セキュリティ・設計・QA）の指摘を反映: 結果に標本・質問条件のハッシュを持たせ不一致の行を無視、非ローカルホストは既定で課金対象・`http://` 拒否、再送は再試行可能な失敗のみ（`--retry-failed`）、Ctrl+C で送信停止、request-id ヘッダー欠落を失敗扱いしない、`no_choice` 状態、壊れた JSONL 行の位置を表示、表のセル中の応答文字列をエスケープ |
 | 0.1.0 | 2026-09-22 | 初版。環境構築のみ（実 Jev 未実行） |

@@ -19,6 +19,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from jevbert.backends.nli import (
+    COMPUTE_DTYPES,
     RESERVED_STRINGS,
     escape_every_angle,
     escape_reserved,
@@ -316,3 +317,15 @@ class TestResolveDtype:
     def test_an_unknown_dtype_fails_loudly(self) -> None:
         with pytest.raises(ValueError, match="dtype"):
             resolve_dtype("int8", torch.device("cuda"))
+
+    @pytest.mark.parametrize("declared", ["int8", "flaot32", "none", ""])
+    def test_an_unknown_dtype_fails_on_the_cpu_too(self, declared: str) -> None:
+        # A-M4: the CPU branch returned float32 without looking at the declaration, so
+        # a typo was silent on a CPU host and a load failure on a GPU one - the machine
+        # that would catch it is the one that serves.
+        with pytest.raises(ValueError, match="dtype"):
+            resolve_dtype(declared, torch.device("cpu"))
+
+    def test_the_allowed_set_is_what_the_resolver_accepts(self) -> None:
+        for declared in COMPUTE_DTYPES:
+            assert resolve_dtype(declared, torch.device("cpu")) is torch.float32

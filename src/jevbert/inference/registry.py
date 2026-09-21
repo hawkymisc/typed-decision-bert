@@ -29,7 +29,7 @@ from jevbert.backends.base import (
     TextPair,
 )
 from jevbert.backends.fake import FakeBackend
-from jevbert.backends.nli import NliZeroShotBackend
+from jevbert.backends.nli import COMPUTE_DTYPES, NliZeroShotBackend
 from jevbert.compiler.compiled import TokenBudget
 from jevbert.compiler.normalize import canonical_json
 from jevbert.compiler.serializer_nli import (
@@ -44,6 +44,12 @@ logger = logging.getLogger("jevbert.registry")
 
 #: The fake bundle only ever loads when the configuration enables it (POC_DESIGN 6.2).
 FAKE_MANIFEST_FILENAME = "jevbert-fake-0.0.0.json"
+
+#: What a manifest may declare in ``dtype``. ``not-applicable`` is the honest answer for
+#: a bundle that runs no tensor computation at all, such as the fake one; a backend that
+#: does compute refuses it, because there is no dtype to fall back to (A-M4).
+NOT_APPLICABLE_DTYPE = "not-applicable"
+DECLARABLE_DTYPES: frozenset[str] = COMPUTE_DTYPES | {NOT_APPLICABLE_DTYPE}
 
 #: Fixed warmup input: a minimum fixture, not a user request (spec 16.1).
 _WARMUP_PAIRS = (
@@ -334,6 +340,11 @@ def _build_nli(manifest: BundleManifest, context: BackendContext) -> Backend:
             f"{', '.join(unverified)}, which the backend loads. "
             "Run `python -m jevbert fetch-model` before starting the server."
         )
+    if manifest.dtype not in COMPUTE_DTYPES:
+        raise ConfigurationError(
+            f"{manifest.public_id}: backend {manifest.backend!r} computes with tensors, "
+            f"so dtype={manifest.dtype!r} names nothing it could run in."
+        )
     try:
         directory = model_directory(context.models_dir, source.repo)
     except FetchError as exc:
@@ -454,6 +465,13 @@ def _check_manifest_against_limits(manifest: BundleManifest, settings: Settings)
         raise ConfigurationError(
             f"{manifest.public_id}: the manifest names template {declared_template!r} "
             f"but this build compiles with {NLI_TEMPLATE_ID!r}."
+        )
+    if manifest.dtype not in DECLARABLE_DTYPES:
+        # A-M4: a misspelled dtype used to be invisible on a CPU host, because the
+        # resolver short-circuited on the device before it looked at the declaration.
+        raise ConfigurationError(
+            f"{manifest.public_id}: dtype={manifest.dtype!r} is not one of "
+            f"{', '.join(sorted(DECLARABLE_DTYPES))}"
         )
     if manifest.confidence != "normalized-entropy-v1":
         raise ConfigurationError(

@@ -272,24 +272,29 @@ _DTYPES: Mapping[str, torch.dtype] = {
     "bfloat16": torch.bfloat16,
 }
 
+#: Everything a manifest may declare for a backend that computes with tensors.
+COMPUTE_DTYPES: frozenset[str] = frozenset({"auto", *_DTYPES})
+
 
 def resolve_dtype(declared: str, device: torch.device) -> torch.dtype:
     """The compute dtype for one device, from what the manifest declares.
 
     The CPU is always FP32: a half-precision matmul there is either unsupported or
-    emulated, so it would be neither the fast path nor a usable reference.
+    emulated, so it would be neither the fast path nor a usable reference. The
+    declaration is still *validated* first (A-M4): short-circuiting on the device made
+    a misspelled dtype silent on a CPU host and a load failure on a GPU host, which is
+    the worst of both - the machine that would have caught it is the one in production.
     """
+    if declared not in COMPUTE_DTYPES:
+        raise ValueError(
+            f"the manifest declares dtype={declared!r}; expected one of "
+            f"{', '.join(sorted(COMPUTE_DTYPES))}"
+        )
     if device.type == "cpu":
         return torch.float32
     if declared == "auto":
         return torch.float16
-    dtype = _DTYPES.get(declared)
-    if dtype is None:
-        raise ValueError(
-            f"the manifest declares dtype={declared!r}; expected one of "
-            f"{', '.join(sorted(_DTYPES))} or 'auto'"
-        )
-    return dtype
+    return _DTYPES[declared]
 
 
 class NliZeroShotBackend:

@@ -26,6 +26,7 @@ from jevbert.api.errors import ValidationError
 from jevbert.config import CompatSettings, Limits
 from jevbert.contracts.validator import validate_request
 from tests.conftest import (
+    AUTH,
     MODEL,
     build_client,
     build_registry,
@@ -186,9 +187,20 @@ class TestValidationDetail:
         assert "detail" not in response.json()
 
     def test_a_404_carries_no_detail(self) -> None:
+        # A-M3: this used to send a wrong key, get a 401 and accept it, so the 404 it
+        # names was never reached. `detail` is a 422-only concession to Jev's schema
+        # (D11), and a 404 that grew one would be JevBERT inventing a shape.
         with _ignore_client() as client:
-            response = client.get("/nope", headers={"Authorization": f"Bearer {'t' * 34}"})
-        assert response.status_code in (401, 404)
+            response = client.get("/nope", headers=AUTH)
+        assert response.status_code == 404
+        payload = response.json()
+        assert payload["error"]["code"] == "not_found"
+        assert "detail" not in payload
+
+    def test_a_405_carries_no_detail(self) -> None:
+        with _ignore_client() as client:
+            response = client.get("/v1/systemone", headers=AUTH)
+        assert response.status_code == 405
         assert "detail" not in response.json()
 
 
@@ -212,12 +224,12 @@ class TestQuestionCount:
         assert response.json()["error"]["path"] == ["questions"]
 
     def test_the_published_limit_says_256(self) -> None:
+        # A-M2: this used to send a wrong key and accept the 401, so it asserted that
+        # capabilities answers *something* and never read the number it is named for.
         with _ignore_client() as client:
-            payload = client.get(
-                "/jevbert/v1/capabilities",
-                headers={"Authorization": f"Bearer {'t' * 34}"},
-            )
-        assert payload.status_code in (200, 401)
+            response = client.get("/jevbert/v1/capabilities", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json()["limits"]["max_questions"] == 256
 
     def test_the_default_limit_is_256(self) -> None:
         assert Limits().max_questions == 256

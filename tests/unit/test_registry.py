@@ -14,9 +14,11 @@ from jevbert.backends.fake import FakeBackend
 from jevbert.backends.nli import NliZeroShotBackend
 from jevbert.compiler.serializer_nli import NLI_TEMPLATE_ID, template_id_of
 from jevbert.config import ConfigurationError, Limits, ServingSettings
-from jevbert.fetch import SOURCE_FILES, model_directory
+from jevbert.fetch import MANIFEST_FILENAME, SOURCE_FILES, model_directory
 from jevbert.inference.registry import (
     _BACKEND_FACTORIES,
+    DECLARABLE_DTYPES,
+    NOT_APPLICABLE_DTYPE,
     BackendContext,
     Bundle,
     BundleManifest,
@@ -29,7 +31,7 @@ from jevbert.inference.registry import (
     read_manifest,
     register_backend_factory,
 )
-from tests.conftest import FAKE_MANIFEST, MODEL, build_settings
+from tests.conftest import FAKE_MANIFEST, MANIFESTS_DIR, MODEL, build_settings
 
 RAW_MANIFEST: dict[str, Any] = json.loads(FAKE_MANIFEST.read_text(encoding="utf-8"))
 
@@ -392,7 +394,11 @@ class TestNliBackendFactory:
         }
         source.update(source_overrides)
         payload = dict(RAW_MANIFEST)
-        payload.update(backend="a0-nli-zeroshot-v2", source_model=source)
+        # The fake manifest declares "not-applicable"; a computing backend needs a real
+        # one (A-M4), so the NLI cases carry the dtype the shipped bundle declares.
+        payload.update(
+            backend="a0-nli-zeroshot-v2", source_model=source, dtype="float32"
+        )
         return BundleManifest.model_validate(payload)
 
     def test_the_backend_id_is_registered(self) -> None:
@@ -448,6 +454,92 @@ class TestNliBackendFactory:
         files = dict.fromkeys(SOURCE_FILES, "ab" * 32)
         with pytest.raises(ConfigurationError, match="repo"):
             build_backend(self._manifest(repo=repo, files=files), _context(tmp_path))
+
+
+class TestDeclaredDtype:
+    """A-M4: the declaration is checked at startup, on every host.
+
+    ``resolve_dtype`` short-circuited on the device, so a misspelled dtype was silent
+    on a CPU machine and a load failure on a GPU one. The machine that would have
+    caught the typo is the machine that serves.
+    """
+
+    def _settings(self, tmp_path: Path) -> Any:
+        return build_settings(manifests_dir=tmp_path, enable_fake_bundle=True)
+
+    @pytest.mark.parametrize("dtype", ["flaot32", "none", "fp16", "", "float64"])
+    def test_a_dtype_outside_the_allowed_set_refuses_startup(
+        self, tmp_path: Path, dtype: str
+    ) -> None:
+        write_manifest(tmp_path, "jevbert-fake-0.0.0.json", dtype=dtype)
+        with pytest.raises(ConfigurationError, match="dtype"):
+            build_registry(self._settings(tmp_path))
+
+    @pytest.mark.parametrize("dtype", sorted(DECLARABLE_DTYPES))
+    def test_every_declarable_dtype_starts(self, tmp_path: Path, dtype: str) -> None:
+        write_manifest(tmp_path, "jevbert-fake-0.0.0.json", dtype=dtype)
+        assert build_registry(self._settings(tmp_path)).bundles
+
+    def test_the_fake_manifest_says_not_applicable_rather_than_a_made_up_value(self) -> None:
+        # The fake backend runs no tensor computation, so naming a real dtype would be
+        # a claim about arithmetic that never happens. It shipped as "none", which was
+        # not a value anything defined.
+        manifest, _ = read_manifest(FAKE_MANIFEST)
+        assert manifest.dtype == NOT_APPLICABLE_DTYPE
+
+    def test_a_computing_backend_refuses_not_applicable(self, tmp_path: Path) -> None:
+        source = {
+            "repo": "MoritzLaurer/bge-m3-zeroshot-v2.0",
+            "revision": "9abf1c8aaeb82a2447809c20753ed0b106b76652",
+            "files": dict.fromkeys(SOURCE_FILES, "ab" * 32),
+        }
+        payload = dict(RAW_MANIFEST)
+        payload.update(
+            backend="a0-nli-zeroshot-v2", source_model=source, dtype=NOT_APPLICABLE_DTYPE
+        )
+        manifest = BundleManifest.model_validate(payload)
+        with pytest.raises(ConfigurationError, match="dtype"):
+            build_backend(manifest, _context(tmp_path))
+
+
+class TestTheDigestCoversTheWeights:
+    """README N11: a changed weight hash has to change the bundle digest.
+
+    The fake manifest has ``source_model: null``, so nothing exercised that claim
+    (A-M6). This uses the real bundle's manifest, which is a JSON file - no weights and
+    no GPU are needed to check what the digest is computed over.
+    """
+
+    def _nli_manifest(self) -> dict[str, Any]:
+        path = MANIFESTS_DIR / MANIFEST_FILENAME
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_the_real_manifest_records_a_hash_per_source_file(self) -> None:
+        source = self._nli_manifest()["source_model"]
+        assert set(source["files"]) >= set(SOURCE_FILES)
+
+    def test_a_changed_weight_hash_changes_the_digest(self) -> None:
+        raw = self._nli_manifest()
+        before = bundle_digest(raw)
+        changed = json.loads(json.dumps(raw))
+        changed["source_model"]["files"]["model.safetensors"] = "00" * 32
+        assert bundle_digest(changed) != before
+
+    def test_a_dropped_weight_hash_changes_the_digest(self) -> None:
+        raw = self._nli_manifest()
+        changed = json.loads(json.dumps(raw))
+        del changed["source_model"]["files"]["model.safetensors"]
+        assert bundle_digest(changed) != bundle_digest(raw)
+
+    def test_a_changed_revision_changes_the_digest(self) -> None:
+        raw = self._nli_manifest()
+        changed = json.loads(json.dumps(raw))
+        changed["source_model"]["revision"] = "0" * 40
+        assert bundle_digest(changed) != bundle_digest(raw)
+
+    def test_the_digest_is_stable_when_nothing_changes(self) -> None:
+        raw = self._nli_manifest()
+        assert bundle_digest(raw) == bundle_digest(json.loads(json.dumps(raw)))
 
 
 class TestSerializerVersionNamesTheTemplate:

@@ -15,7 +15,7 @@
   },
   "confidence": "normalized-entropy-v1",
   "usage_semantics": "expanded-input-a0-v1",
-  "dtype": "none",
+  "dtype": "not-applicable",
   "limits": {
     "max_sequence_tokens": 2048,
     "max_request_tokens": 131072

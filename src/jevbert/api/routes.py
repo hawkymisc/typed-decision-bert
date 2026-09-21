@@ -27,11 +27,10 @@ from jevbert.api.errors import (
 from jevbert.backends.base import CancelToken, EncodedSequence, InferenceCancelled
 from jevbert.compiler.compiled import EncodedRequest
 from jevbert.compiler.serializer_nli import (
-    NLI_TEMPLATE_ID,
-    SERIALIZER_VERSION,
     all_sequences,
     compile_and_encode,
     split_by_question,
+    template_id_of,
 )
 from jevbert.config import Limits
 from jevbert.contracts.response import build_response
@@ -257,7 +256,7 @@ def _bundle_capabilities(bundle: Bundle) -> dict[str, Any]:
         "state": bundle.state.value,
         "backend": manifest.backend,
         "serializer": manifest.serializer_version,
-        "template": NLI_TEMPLATE_ID if manifest.serializer_version == SERIALIZER_VERSION else None,
+        "template": template_id_of(manifest.serializer_version),
         "source_model": (
             None if source is None else {"repo": source.repo, "revision": source.revision}
         ),

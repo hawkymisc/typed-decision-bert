@@ -23,6 +23,11 @@ from jevbert.backends.base import (
     TextPair,
 )
 from jevbert.backends.fake import FakeBackend
+from jevbert.compiler.serializer_nli import (
+    DEFAULT_TEMPLATE,
+    NLI_TEMPLATE_ID,
+    SERIALIZER_VERSION_FULL,
+)
 from jevbert.config import ConfigurationError, ServingSettings, Settings
 from jevbert.inference.registry import build_registry as registry_from_settings
 from tests.conftest import (
@@ -647,3 +652,20 @@ class TestBackendContractGuard:
             )
         assert response.status_code == 500
         assert response.json()["error"]["code"] == "inference_error"
+
+
+class TestCapabilitiesNamesTheTemplate:
+    """spec 5.7: the serializer a bundle publishes includes its template (K4)."""
+
+    def test_the_template_is_published_not_null(self, client: TestClient) -> None:
+        bundle = client.get("/jevbert/v1/capabilities", headers=AUTH).json()["bundles"][0]
+        assert bundle["serializer"] == SERIALIZER_VERSION_FULL
+        assert bundle["template"] == NLI_TEMPLATE_ID
+
+    def test_the_published_template_is_the_one_that_compiles(
+        self, client: TestClient
+    ) -> None:
+        # A published template ID that is not the one in force would be a claim about
+        # the model input that the compiled input does not honour.
+        bundle = client.get("/jevbert/v1/capabilities", headers=AUTH).json()["bundles"][0]
+        assert bundle["template"] == DEFAULT_TEMPLATE.template_id

@@ -1794,5 +1794,5 @@ Noulには`probabilities_from_logits([false_logit, true_logit], T)[1]`を使う�
 | 日付 | 版 | 内容 |
 | --- | --- | --- |
 | 2026-09-21 | 0.1.0 | JevBERTとして初版作成。互換範囲、モデル構成、学習、校正、評価、運用、移行、schema、数値参照実装を定義 |
-| 2026-09-21 | 0.3.0 | 互換性優先の方針を明文化（ADR-016）：トップレベル未知フィールドを既定で無視（5.3節）、422本文へJev schemaと同形の`detail`を併記（3.4・5.9節）、質問数上限を32→256（4.2節、付録A・B、CT01）、PoC設定での`jev-latest`・`jev-preview` alias有効化（18.3節）。付録Cの検算値の注記を追加 |
 | 2026-09-21 | 0.2.0 | 公式SDK 0.7.0の実装観測を反映（3.3節U01・U02・U06、3.4節新設、5.7節`x-typesafe-request-id`・`X-JevBERT-Calibration`、5.9節404/405とSDK retry、13.7節SDK試験項目）。A0系のusage定義`expanded-input-a0-v1`を追加（5.8節）。P0.5（PoC）段階とzero-shot NLI backendを定義（7.1・7.2・7.7節、第19章）。Laya・simple-jevの追加調査結果と不採用理由を記録（7.6節、ADR-012）。ADR-011〜015、OPEN-09・10、S18〜S20を追加。PoCの実装設計を`docs/POC_DESIGN.md`へ分離 |
+| 2026-09-21 | 0.3.0 | 互換性優先の方針を明文化（ADR-016）：トップレベル未知フィールドを既定で無視（5.3節）、422本文へJev schemaと同形の`detail`を併記（3.4・5.9節）、質問数上限を32→256（4.2節、付録A・B、CT01）、PoC設定での`jev-latest`・`jev-preview` alias有効化（18.3節）。付録Cの検算値の注記を追加 |

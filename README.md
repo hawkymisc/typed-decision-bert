@@ -3,6 +3,11 @@
 BERT 系 encoder を用いた、Jev 互換 API を目指す指示条件付き意思決定エンジン。
 本リポジトリは **P0.5（PoC）段階**である。
 
+> **非公式の独立プロジェクトです。** TypeSafe 社とは提携・後援・承認のいずれの関係もありません。
+> 「Jev」「System One」「TypeSafe」は同社の名称であり、本リポジトリでは互換対象の API を指し示す目的でのみ使用しています。
+> Jev のモデル・重み・コードは一切含まず、実 Jev サーバーとの照合も行っていません（[互換性の現状](#互換性の現状)）。
+> リポジトリ名は `typed-decision-bert`、Python パッケージ名とプロジェクトの作業名は `jevbert` / JevBERT です。
+
 - 仕様・設計書: [JevBERT_spec_design.md](JevBERT_spec_design.md)（v0.3.0）
 - PoC 実装設計書: [docs/POC_DESIGN.md](docs/POC_DESIGN.md)
 - **実測結果**: [docs/POC_RESULTS.md](docs/POC_RESULTS.md)
@@ -212,5 +217,5 @@ print(response.answers["department"].choice)
 
 ## ライセンス
 
-- 本リポジトリ: MIT
+- 本リポジトリ: MIT（[LICENSE](LICENSE)）
 - バックボーン `MoritzLaurer/bge-m3-zeroshot-v2.0`: MIT（配布物には含めない。`fetch-model` で取得する）

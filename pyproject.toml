@@ -22,6 +22,9 @@ dependencies = [
 jevbert = "jevbert.__main__:main"
 
 [dependency-groups]
+bench = [
+    "pyarrow>=21",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -47,6 +50,10 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+# `uv sync` installs the benchmark harness's dependencies too, so its tests run everywhere.
+[tool.uv]
+default-groups = ["dev", "bench"]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 
@@ -56,6 +63,10 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "C4", "PLC0415"]
+
+[tool.ruff.lint.isort]
+# The benchmark harness lives at the top level, beside `scripts/` (docs/BENCHMARK.md).
+known-first-party = ["bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

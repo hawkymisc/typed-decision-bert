@@ -12,6 +12,7 @@ BERT 系 encoder を用いた、Jev 互換 API を目指す指示条件付き意
 - PoC 実装設計書: [docs/POC_DESIGN.md](docs/POC_DESIGN.md)
 - **実測結果**: [docs/POC_RESULTS.md](docs/POC_RESULTS.md)
 - Jev との差分・未確認事項: [compat/differences.md](compat/differences.md)
+- 分類ベンチマーク環境（実 Jev ⇔ ローカルの比較）: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 
 ---
 
